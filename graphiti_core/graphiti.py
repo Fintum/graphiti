@@ -677,6 +677,341 @@ class Graphiti:
 
         return resolved_edges, invalidated_edges, new_edges
 
+    async def _extract_nodes_and_edges_only(
+        self,
+        entity_types: dict[str, type[BaseModel]] | None = None,
+        excluded_entity_types: list[str] | None = None,
+        edge_types: dict[str, type[BaseModel]] | None = None,
+        edge_type_map: dict[tuple[str, str], list[str]] | None = None,
+        custom_extraction_instructions: str | None = None,
+        # High-level parameters (from episode content)
+        episode_body: str | None = None,
+        source_description: str | None = None,
+        reference_time: datetime | None = None,
+        source: EpisodeType | None = None,
+        group_id: str | None = None,
+        uuid: str | None = None,
+        saga: str | None = None,
+    ) -> tuple[list[EntityNode], dict[str, list[int]], list[EntityEdge], EpisodicNode]:
+        """Validate entity types and extract nodes and edges from episode.
+
+        Only performs extraction - does NOT resolve extracted entities against
+        the existing graph. Use this when you need raw extraction before resolution.
+
+        Takes episode content parameters and automatically creates an EpisodicNode,
+        retrieves previous episodes for context, and extracts entities and relationships.
+
+        Parameters
+        ----------
+        entity_types : dict[str, type[BaseModel]] | None
+            Optional custom entity type definitions.
+        excluded_entity_types : list[str] | None
+            Entity types to exclude from extraction.
+        edge_types : dict[str, type[BaseModel]] | None
+            Optional custom edge type definitions.
+        edge_type_map : dict[tuple[str, str], list[str]] | None
+            Mapping of (source_type, target_type) to allowed edge types.
+        custom_extraction_instructions : str | None
+            Additional instructions for the extraction LLM.
+        episode_body : str
+            Content of the episode.
+        source_description : str
+            Description of the episode source.
+        reference_time : datetime
+            When the episode occurred.
+        source : EpisodeType, optional
+            Type of episode. Defaults to EpisodeType.message.
+        group_id : str | None
+            Graph partition ID. Uses default if None.
+        uuid : str | None
+            Optional UUID of existing episode.
+        saga : str | None
+            Optional saga name (used as episode name if no explicit name provided).
+
+        Returns
+        -------
+        tuple[list[EntityNode], dict[str, list[int]], list[EntityEdge], EpisodicNode]
+            - extracted_nodes: Raw extracted entity nodes
+            - node_episode_index_map: Mapping from node UUID to episode indices
+            - extracted_edges: Raw extracted entity edges (unresolved)
+            - episode: The EpisodicNode (created or retrieved)
+        """
+        # Validate types
+        validate_entity_types(entity_types)
+        validate_excluded_entity_types(excluded_entity_types, entity_types)
+
+        # Handle group_id
+        resolved_group_id = group_id
+        if resolved_group_id is None:
+            resolved_group_id = get_default_group_id(self.driver.provider)
+        else:
+            validate_group_id(resolved_group_id)
+            if resolved_group_id != self.driver._database:
+                self.driver = self.driver.clone(database=resolved_group_id)
+                self.clients.driver = self.driver
+
+        # Create or retrieve episode
+        episode = (
+            await EpisodicNode.get_by_uuid(self.driver, uuid)
+            if uuid is not None
+            else EpisodicNode(
+                name=saga or 'Episode',
+                group_id=resolved_group_id,
+                labels=[],
+                source=source or EpisodeType.message,
+                content=episode_body or '',
+                source_description=source_description or '',
+                created_at=utc_now(),
+                valid_at=reference_time or utc_now(),
+            )
+        )
+
+        # Retrieve previous episodes for context
+        previous_episodes = await self.retrieve_episodes(
+            reference_time or utc_now(),
+            last_n=RELEVANT_SCHEMA_LIMIT,
+            group_ids=[resolved_group_id],
+            source=source,
+        )
+
+        # Create default edge type map
+        edge_type_map_default = (
+            {('Entity', 'Entity'): list(edge_types.keys())}
+            if edge_types is not None
+            else {('Entity', 'Entity'): []}
+        )
+
+        # Extract nodes from episode
+        extracted_nodes, node_episode_index_map = await extract_nodes(
+            self.clients,
+            episode,
+            previous_episodes,
+            entity_types,
+            excluded_entity_types,
+            custom_extraction_instructions,
+        )
+
+        # Extract edges from episode (no resolution yet)
+        extracted_edges = await extract_edges(
+            self.clients,
+            episode,
+            extracted_nodes,
+            previous_episodes,
+            edge_type_map or edge_type_map_default,
+            episode.group_id,
+            edge_types,
+            custom_extraction_instructions,
+        )
+
+        return extracted_nodes, node_episode_index_map, extracted_edges, episode
+
+    async def _resolve_and_hydrate_nodes_edges(
+        self,
+        episode: EpisodicNode,
+        extracted_nodes: list[EntityNode],
+        extracted_edges: list[EntityEdge],
+        entity_types: dict[str, type[BaseModel]] | None = None,
+        edge_types: dict[str, type[BaseModel]] | None = None,
+        edge_type_map: dict[tuple[str, str], list[str]] | None = None,
+        custom_extraction_instructions: str | None = None,
+    ) -> tuple[
+        list[EntityNode], list[EntityEdge], list[EntityEdge], dict[str, str], list[EntityNode]
+    ]:
+        """Handle group_id, resolve nodes and edges, and extract node attributes.
+
+        Takes extracted entities and resolves them against the existing graph,
+        extracts node attributes, and prepares data for persistence.
+
+        Parameters
+        ----------
+        episode : EpisodicNode
+            The episode being processed (already has group_id set).
+        extracted_nodes : list[EntityNode]
+            Raw extracted nodes from LLM.
+        extracted_edges : list[EntityEdge]
+            Raw extracted edges from LLM.
+        entity_types : dict[str, type[BaseModel]] | None
+            Custom entity type definitions.
+        edge_types : dict[str, type[BaseModel]] | None
+            Custom edge type definitions.
+        edge_type_map : dict[tuple[str, str], list[str]] | None
+            Mapping of (source_type, target_type) to allowed edge types.
+        custom_extraction_instructions : str | None
+            Additional extraction instructions.
+
+        Returns
+        -------
+        tuple[list[EntityNode], list[EntityEdge], list[EntityEdge], dict[str, str], list[EntityNode]]
+            - resolved_nodes: Nodes after deduplication and merging with graph
+            - resolved_edges: Valid edges after graph resolution
+            - invalidated_edges: Edges contradicted by new information
+            - uuid_map: Mapping from extracted UUID to resolved UUID
+            - hydrated_nodes: Nodes with extracted attributes and summaries
+        """
+        # Create default edge type map
+        edge_type_map_default = (
+            {('Entity', 'Entity'): list(edge_types.keys())}
+            if edge_types is not None
+            else {('Entity', 'Entity'): []}
+        )
+
+        # Retrieve previous episodes for resolution context
+        previous_episodes = await self.retrieve_episodes(
+            episode.valid_at or utc_now(),
+            last_n=RELEVANT_SCHEMA_LIMIT,
+            group_ids=[episode.group_id],
+            source=episode.source,
+        )
+
+        # Resolve extracted nodes against existing graph
+        resolved_nodes, uuid_map, _ = await resolve_extracted_nodes(
+            self.clients,
+            extracted_nodes,
+            episode,
+            previous_episodes,
+            entity_types,
+        )
+
+        # Resolve edge pointers and validate edges against graph
+        edges_with_resolved_pointers = resolve_edge_pointers(extracted_edges, uuid_map)
+
+        resolved_edges, invalidated_edges, new_edges = await resolve_extracted_edges(
+            self.clients,
+            edges_with_resolved_pointers,
+            episode,
+            resolved_nodes,
+            edge_types or {},
+            edge_type_map or edge_type_map_default,
+        )
+
+        # Extract node attributes (using only new edges to avoid duplication)
+        hydrated_nodes = await extract_attributes_from_nodes(
+            self.clients,
+            resolved_nodes,
+            episode,
+            previous_episodes,
+            entity_types,
+            edges=new_edges,
+        )
+
+        return resolved_nodes, resolved_edges, invalidated_edges, uuid_map, hydrated_nodes
+
+    async def _persist_episode_to_graph(
+        self,
+        episode: EpisodicNode,
+        hydrated_nodes: list[EntityNode],
+        entity_edges: list[EntityEdge],
+        node_episode_index_map: dict[str, list[int]],
+        group_id: str,
+        saga: str | SagaNode | None = None,
+        saga_previous_episode_uuid: str | None = None,
+        update_communities: bool = False,
+    ) -> tuple[list[EpisodicEdge], EpisodicNode, list[CommunityNode], list[CommunityEdge]]:
+        """Persist episode data to graph including nodes, edges, and optional saga/communities.
+
+        Saves all resolved entities to the knowledge graph, optionally associates
+        the episode with a saga, and updates community summaries if requested.
+
+        Parameters
+        ----------
+        episode : EpisodicNode
+            The episode to persist.
+        hydrated_nodes : list[EntityNode]
+            Nodes with extracted attributes.
+        entity_edges : list[EntityEdge]
+            All entity edges (resolved + invalidated).
+        node_episode_index_map : dict[str, list[int]]
+            Mapping from node UUID to episode indices.
+        group_id : str
+            Graph partition ID.
+        saga : str | SagaNode | None
+            Optional saga name or node to associate episode with.
+        saga_previous_episode_uuid : str | None
+            Optional UUID of previous episode in saga for efficient chaining.
+        update_communities : bool
+            Whether to regenerate community summaries.
+
+        Returns
+        -------
+        tuple[list[EpisodicEdge], EpisodicNode, list[CommunityNode], list[CommunityEdge]]
+            - episodic_edges: Edges linking episode to entities
+            - episode: Updated episode node
+            - communities: Updated community nodes (if update_communities=True)
+            - community_edges: Community relationships (if update_communities=True)
+        """
+        now = utc_now()
+
+        # Build episodic edges and clear raw content if configured
+        episodic_edges = build_episodic_edges(
+            hydrated_nodes, episode.uuid, now, node_episode_index_map
+        )
+        if not self.store_raw_episode_content:
+            episode.content = ''
+
+        # Save episode, episodic edges, nodes, and entity edges to graph
+        await add_nodes_and_edges_bulk(
+            self.driver,
+            [episode],
+            episodic_edges,
+            hydrated_nodes,
+            entity_edges,
+            self.embedder,
+        )
+
+        # Handle saga association if provided
+        if saga is not None:
+            if isinstance(saga, str):
+                saga_created_at = episode.valid_at or now
+                saga_node = await self._get_or_create_saga(saga, group_id, saga_created_at)
+            else:
+                saga_node = saga
+
+            # Get previous episode UUID (either provided or queried)
+            previous_episode_uuid: str | None = saga_previous_episode_uuid
+            if previous_episode_uuid is None:
+                previous_episode_uuid = await self._saga_get_previous_episode_uuid(
+                    saga_node.uuid, episode.uuid
+                )
+
+            # Create NEXT_EPISODE edge from previous episode
+            if previous_episode_uuid is not None:
+                next_episode_edge = NextEpisodeEdge(
+                    source_node_uuid=previous_episode_uuid,
+                    target_node_uuid=episode.uuid,
+                    group_id=group_id,
+                    created_at=now,
+                )
+                await next_episode_edge.save(self.driver)
+
+            # Create HAS_EPISODE edge from saga to episode
+            has_episode_edge = HasEpisodeEdge(
+                source_node_uuid=saga_node.uuid,
+                target_node_uuid=episode.uuid,
+                group_id=group_id,
+                created_at=now,
+            )
+            await has_episode_edge.save(self.driver)
+
+            # Track first and last episode on saga
+            if saga_node.first_episode_uuid is None:
+                saga_node.first_episode_uuid = episode.uuid
+            saga_node.last_episode_uuid = episode.uuid
+            await saga_node.save(self.driver)
+
+        # Update communities if requested
+        communities = []
+        community_edges = []
+        if update_communities:
+            communities, community_edges = await semaphore_gather(
+                *[
+                    update_community(self.driver, self.llm_client, self.embedder, node)
+                    for node in hydrated_nodes
+                ],
+                max_coroutines=self.max_coroutines,
+            )
+
+        return episodic_edges, episode, communities, community_edges
+
     async def _process_episode_data(
         self,
         episode: EpisodicNode | list[EpisodicNode],
@@ -976,6 +1311,132 @@ class Graphiti:
                 pass
 
         return await retrieve_episodes(driver, reference_time, last_n, group_ids, source, saga)
+
+    async def _add_episode_composed(
+        self,
+        name: str,
+        episode_body: str,
+        source_description: str,
+        reference_time: datetime,
+        source: EpisodeType = EpisodeType.message,
+        group_id: str | None = None,
+        uuid: str | None = None,
+        update_communities: bool = False,
+        entity_types: dict[str, type[BaseModel]] | None = None,
+        excluded_entity_types: list[str] | None = None,
+        previous_episode_uuids: list[str] | None = None,
+        edge_types: dict[str, type[BaseModel]] | None = None,
+        edge_type_map: dict[tuple[str, str], list[str]] | None = None,
+        custom_extraction_instructions: str | None = None,
+        saga: str | SagaNode | None = None,
+        saga_previous_episode_uuid: str | None = None,
+    ) -> AddEpisodeResults:
+        """Compose add_episode using three focused helper functions.
+
+        This function demonstrates how to use the three helper functions:
+        1. _extract_nodes_and_edges_only() - Extract without resolving
+        2. _resolve_and_hydrate_nodes_edges() - Resolve and hydrate extracted data
+        3. _persist_episode_to_graph() - Persist to graph and handle saga/communities
+
+        This implementation has identical functionality to add_episode() but uses
+        smaller, more testable and composable components.
+
+        Parameters are identical to add_episode().
+        """
+        start = time()
+        now = utc_now()
+
+        with self.tracer.start_span('add_episode_composed') as span:
+            try:
+                # Step 1: Extract nodes and edges (creates episode internally)
+                extracted_nodes, node_episode_index_map, extracted_edges, episode = (
+                    await self._extract_nodes_and_edges_only(
+                        entity_types=entity_types,
+                        excluded_entity_types=excluded_entity_types,
+                        edge_types=edge_types,
+                        edge_type_map=edge_type_map,
+                        custom_extraction_instructions=custom_extraction_instructions,
+                        episode_body=episode_body,
+                        source_description=source_description,
+                        reference_time=reference_time,
+                        source=source,
+                        group_id=group_id,
+                        uuid=uuid,
+                        saga=saga or name,
+                    )
+                )
+
+                # Get resolved group_id from the episode (already handled in extraction)
+                resolved_group_id = episode.group_id
+
+                # Step 2: Resolve nodes/edges and extract attributes
+                (
+                    resolved_nodes,
+                    resolved_edges,
+                    invalidated_edges,
+                    uuid_map,
+                    hydrated_nodes,
+                ) = await self._resolve_and_hydrate_nodes_edges(
+                    episode,
+                    extracted_nodes,
+                    extracted_edges,
+                    entity_types,
+                    edge_types,
+                    edge_type_map,
+                    custom_extraction_instructions,
+                )
+
+                entity_edges = resolved_edges + invalidated_edges
+
+                # Step 3: Persist to graph
+                episodic_edges, episode, communities, community_edges = (
+                    await self._persist_episode_to_graph(
+                        episode,
+                        hydrated_nodes,
+                        entity_edges,
+                        node_episode_index_map,
+                        resolved_group_id,
+                        saga,
+                        saga_previous_episode_uuid,
+                        update_communities,
+                    )
+                )
+
+                end = time()
+
+                # Add span attributes
+                span.add_attributes(
+                    {
+                        'episode.uuid': episode.uuid,
+                        'episode.source': (source or EpisodeType.message).value,
+                        'episode.reference_time': reference_time.isoformat(),
+                        'group_id': resolved_group_id,
+                        'node.count': len(hydrated_nodes),
+                        'edge.count': len(entity_edges),
+                        'edge.invalidated_count': len(invalidated_edges),
+                        'entity_types.count': len(entity_types) if entity_types else 0,
+                        'edge_types.count': len(edge_types) if edge_types else 0,
+                        'update_communities': update_communities,
+                        'communities.count': len(communities) if update_communities else 0,
+                        'duration_ms': (end - start) * 1000,
+                    }
+                )
+
+                logger.info(f'Completed add_episode_composed in {(end - start) * 1000} ms')
+
+                return AddEpisodeResults(
+                    episode=episode,
+                    episodic_edges=episodic_edges,
+                    nodes=hydrated_nodes,
+                    edges=entity_edges,
+                    communities=communities,
+                    community_edges=community_edges,
+                )
+
+            except Exception as e:
+                span.set_status('error', str(e))
+                span.record_exception(e)
+                raise e
 
     async def add_episode(
         self,
