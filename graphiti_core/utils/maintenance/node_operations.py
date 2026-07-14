@@ -54,7 +54,9 @@ from graphiti_core.utils.maintenance.dedup_helpers import (
 from graphiti_core.utils.text_utils import (
     MAX_SUMMARY_CHARS,
     concatenate_episodes,
+    split_episode,
     truncate_at_sentence,
+    compare_names_list
 )
 
 logger = logging.getLogger(__name__)
@@ -147,6 +149,88 @@ async def extract_nodes(
 
     logger.debug(f'Extracted nodes: {[n.uuid for n in extracted_nodes]}')
     return extracted_nodes, node_episode_index_map
+
+
+async def extract_nodes_split(
+        clients: GraphitiClients,
+        episode: EpisodicNode,
+        previous_episodes: list[EpisodicNode],
+        entity_types: dict[str, type[BaseModel]] | None = None,
+        excluded_entity_types: list[str] | None = None,
+        custom_extraction_instructions: str | None = None,
+    ) -> tuple[list[EntityNode], dict[str, list[int]]]:
+    """Extract entity nodes splitting the episode into several."""
+
+    start = time()
+    # llm_client = _graphiti.clients.llm_client
+    llm_client = clients.llm_client
+
+    episode_list = split_episode(episode)
+
+    previous_episodes: list[EpisodicNode] = []
+    extracted_nodes: list[EpisodicNode] = []
+    node_episode_index_map: dict[str, list[int]] = {}
+    for episode_chunck in episode_list:
+        if episode_chunck["is_empty"]:
+            continue
+        
+        entity_types_chunk = {
+            key: value 
+            for key, value in entity_types.items() 
+            if key in episode_chunck["entities"]
+        }
+
+        # Build entity types context
+        entity_types_context = _build_entity_types_context(entity_types_chunk)
+
+        # Build base context
+        custom_extraction_instructions: dict[str, str] = {
+            "tasks": "Extract all tasks",
+            "participants": "Extract all participants",
+            "main": None,
+            "chapters": None,
+        }
+        context = {
+            'episode_content': episode_chunck["episode"].content,
+            'episode_timestamp': episode.valid_at.isoformat(),
+            'previous_episodes': [
+                {
+                    'content': ep.content,
+                    'timestamp': episode.valid_at.isoformat(),
+                }
+                for ep in previous_episodes
+            ],
+            'custom_extraction_instructions': custom_extraction_instructions.get(episode_chunck["name"]) or '',
+            'entity_types': entity_types_context,
+            'source_description': episode.source_description,
+        }
+
+        # Extract entities
+        extracted_entities = await _extract_nodes_single(llm_client, episode_chunck["episode"], context)
+
+        # Filter empty names
+        filtered_entities = [e for e in extracted_entities if e.name.strip()]
+
+        # Convert to EntityNode objects with episode attribution
+        excluded_entity_types = []
+        extracted_nodes_chunck, node_episode_index_map_chunk = _create_entity_nodes(
+            filtered_entities, entity_types_context, excluded_entity_types, [episode_chunck["episode"]]
+        )
+
+        # Next
+        previous_episodes.append(episode_chunck["episode"])
+        extracted_nodes.extend(extracted_nodes_chunck)
+        node_episode_index_map.update(node_episode_index_map_chunk)
+
+    # Deduplicate
+    extracted_nodes = _collapse_exact_duplicate_extracted_nodes(extracted_nodes, node_episode_index_map)
+
+    # Log
+    end = time()
+    logger.info(f'Extracted {len(extracted_nodes)} entities in {(end - start) * 1000:.0f} ms')
+    logger.debug(f'Extracted nodes: {[n.uuid for n in extracted_nodes]}')
+    return extracted_nodes, node_episode_index_map
+
 
 
 def _build_entity_types_context(
@@ -353,8 +437,16 @@ def _collapse_exact_duplicate_extracted_nodes(
     ordered_names: list[str] = []
 
     for node in extracted_nodes:
-        normalized_name = _normalize_string_exact(node.name)
-        existing = canonical_by_name.get(normalized_name)
+        if 'Person' in node.labels:         # exact + fuzz matching
+            normalized_name = _normalize_string_exact(node.name)
+            existing_exact = canonical_by_name.get(normalized_name)
+            fuzz_name = compare_names_list(normalized_name, canonical_by_name.keys())
+            existing_fuzz = canonical_by_name.get(fuzz_name) if fuzz_name else None
+            existing = existing_exact or existing_fuzz
+        else:                               # Only exact
+            normalized_name = _normalize_string_exact(node.name)
+            existing = canonical_by_name.get(normalized_name)
+
         if existing is None:
             canonical_by_name[normalized_name] = node
             ordered_names.append(normalized_name)

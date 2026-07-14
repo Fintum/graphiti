@@ -16,8 +16,12 @@ limitations under the License.
 
 from __future__ import annotations
 
+import json
 import re
 from typing import TYPE_CHECKING
+
+from thefuzz import fuzz  # type: ignore
+
 
 if TYPE_CHECKING:
     from graphiti_core.nodes import EpisodicNode
@@ -73,3 +77,66 @@ def concatenate_episodes(episodes: list[EpisodicNode]) -> str:
         timestamp = ep.valid_at.isoformat() if ep.valid_at else 'unknown'
         parts.append(f'[Episode {i}] (timestamp: {timestamp})\n{ep.content}')
     return '\n\n'.join(parts)
+
+
+def split_episode(episode: EpisodicNode) -> list[dict]:
+    episode_body: dict = json.loads(episode.content)
+
+    content_chapters = episode_body.pop("chapters", None)
+    content_tasks = episode_body.pop("tasks", None)
+    content_participants = episode_body.pop("participants", None)
+    content_main = episode_body
+
+    episode_main = episode.model_copy()
+    episode_chapters = episode.model_copy()
+    episode_tasks = episode.model_copy()
+    episode_participants = episode.model_copy()
+
+    episode_main.content = json.dumps(content_main)
+    episode_chapters.content = json.dumps(content_chapters)
+    episode_tasks.content = json.dumps(content_tasks)
+    episode_participants.content = json.dumps(content_participants)
+
+    return [
+        {"episode": episode_participants, "name": "participants", "is_empty": content_participants is None, "entities": ["Person"]}, 
+        {"episode": episode_main, "name": "main", "is_empty": False, "entities": ["Person", "Company", "Project", "Signal", "Decision"]}, 
+        {"episode": episode_tasks, "name": "tasks", "is_empty": False, "entities": ["Task"]}, 
+        {"episode": episode_chapters, "name": "chapters", "is_empty": False, "entities": ["Person", "Company", "Project", "Signal"]}, 
+    ]
+
+
+
+
+def compare_names(
+        target: str, 
+        choice: str,
+        clean_names: bool = False
+    ) -> int:
+    """Use fuzz library to get the similarity ratio."""
+    # compare_names('Ernesto Hernandez', 'Ernesto')
+    # cutoff >= 60
+
+    if clean_names:
+        pattern = r'[0-9/()]'
+        target = re.sub(pattern, '', target.replace('y','i').lower()).strip()
+        choice = re.sub(pattern, '', choice.replace('y','i').lower()).strip()
+
+    # return int(difflib.SequenceMatcher(None, target, choice).quick_ratio() * 100)
+    score: int = fuzz.ratio(target, choice)
+    return score
+
+
+
+def compare_names_list(
+        name: str, 
+        targets: list[str],
+        clean_names: bool = False,
+        threshold: int = 70,
+    ) -> str | None:
+
+    for target in targets:
+        if compare_names(name, target, clean_names) > threshold:
+            return target
+        if name in target:
+            return target
+    return None
