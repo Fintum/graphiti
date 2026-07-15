@@ -691,7 +691,7 @@ class Graphiti:
             custom_extraction_instructions: str | None = None,
             saga: str | None = None,
             get_previous_episodes: bool = False
-        ) -> tuple[list[EntityNode], dict[str, list[int]], list[EntityEdge], EpisodicNode]:
+        ) -> tuple[list[EntityNode], dict[str, list[int]], list[EntityEdge]]:
         """Validate entity types and extract nodes and edges from episode."""
 
         # Validate types
@@ -740,7 +740,7 @@ class Graphiti:
         return extracted_nodes, node_episode_index_map, extracted_edges
 
 
-    async def _resolve_and_hydrate_nodes_edges(
+    async def resolve_and_hydrate_nodes_edges(
             self,
             group_id: str,
             episode: EpisodicNode,
@@ -752,7 +752,7 @@ class Graphiti:
             saga: str | None = None,
             get_previous_episodes: bool = False
         ) -> tuple[list[EntityNode], list[EntityEdge], list[EntityEdge], dict[str, str]]:
-        """Resolve nodes and edges, and extract node attributes."""
+        """Step 2. Resolve nodes and edges, and extract node attributes."""
 
         # Create default edge type map
         edge_type_map_default = (
@@ -807,7 +807,7 @@ class Graphiti:
 
         return hydrated_nodes, resolved_edges, invalidated_edges, uuid_map
 
-    async def _persist_episode_to_graph(
+    async def persist_episode_to_graph(
             self,
             group_id: str,
             episode: EpisodicNode,
@@ -818,7 +818,7 @@ class Graphiti:
             saga_previous_episode_uuid: str | None = None,
             update_communities: bool = False,
         ) -> AddEpisodeResults:
-        """Persist episode data to graph including nodes, edges, and optional saga/communities."""
+        """Step 3. Persist episode data to graph including nodes, edges, and optional saga/communities."""
         now = utc_now()
 
         # Build episodic edges and clear raw content if configured
