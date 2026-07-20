@@ -684,6 +684,7 @@ class Graphiti:
             group_id: str,
             episode: EpisodicNode,
             reference_time: datetime | None = None,
+            document_node: EntityNode | None = None,
             entity_types: dict[str, type[BaseModel]] | None = None,
             excluded_entity_types: list[str] | None = None,
             edge_types: dict[str, type[BaseModel]] | None = None,
@@ -692,7 +693,7 @@ class Graphiti:
             saga: str | None = None,
             get_previous_episodes: bool = False
         ) -> tuple[list[EntityNode], dict[str, list[int]], list[EntityEdge]]:
-        """Validate entity types and extract nodes and edges from episode."""
+        """Step 1. Validate entity types and extract nodes and edges from episode."""
 
         # Validate types
         validate_entity_types(entity_types)
@@ -724,6 +725,9 @@ class Graphiti:
             excluded_entity_types,
             custom_extraction_instructions,
         )
+        if document_node is not None:
+            extracted_nodes.insert(0, document_node)
+            node_episode_index_map[document_node.uuid] = [0]
 
         # Extract edges from episode
         extracted_edges = await extract_edges(
@@ -815,7 +819,7 @@ class Graphiti:
             all_entity_edges: list[EntityEdge],
             node_episode_index_map: dict[str, list[int]],
             saga: str | SagaNode | None = None,
-            saga_previous_episode_uuid: str | None = None,
+            # saga_previous_episode_uuid: str | None = None,
             update_communities: bool = False,
         ) -> AddEpisodeResults:
         """Step 3. Persist episode data to graph including nodes, edges, and optional saga/communities."""
@@ -847,11 +851,9 @@ class Graphiti:
                 saga_node = saga
 
             # Get previous episode UUID (either provided or queried)
-            previous_episode_uuid: str | None = saga_previous_episode_uuid
-            if previous_episode_uuid is None:
-                previous_episode_uuid = await self._saga_get_previous_episode_uuid(
-                    saga_node.uuid, episode.uuid
-                )
+            previous_episode_uuid = await self._saga_get_previous_episode_uuid(
+                saga_node.uuid, episode.uuid
+            )
 
             # Create NEXT_EPISODE edge from previous episode
             if previous_episode_uuid is not None:
