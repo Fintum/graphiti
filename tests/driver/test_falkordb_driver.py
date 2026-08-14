@@ -14,17 +14,27 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import asyncio
+import gc
+import logging
 import os
 import unittest
 from datetime import datetime, timezone
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from graphiti_core.driver.driver import GraphProvider
+from graphiti_core.graph_queries import get_fulltext_indices, get_range_indices
 
 try:
-    from graphiti_core.driver.falkordb_driver import FalkorDriver, FalkorDriverSession
+    from graphiti_core.driver.falkordb_driver import (
+        FalkorDriver,
+        FalkorDriverSession,
+        describe_index_query,
+        index_already_exists_error,
+    )
 
     HAS_FALKORDB = True
 except ImportError:
@@ -399,6 +409,291 @@ class TestDatetimeConversion:
         assert convert_datetimes_to_strings(123) == 123
         assert convert_datetimes_to_strings(None) is None
         assert convert_datetimes_to_strings(True) is True
+
+
+INDEX_QUERIES = (
+    get_range_indices(GraphProvider.FALKORDB) + get_fulltext_indices(GraphProvider.FALKORDB)
+    if HAS_FALKORDB
+    else []
+)
+INDEX_QUERY_COUNT = len(INDEX_QUERIES)
+RELATES_TO_FULLTEXT_QUERY = INDEX_QUERIES[-1] if INDEX_QUERIES else ''
+LOGGER_NAME = 'graphiti_core.driver.falkordb_driver'
+
+
+class RecordingExecutor:
+    """Stands in for FalkorDriver.execute_query, recording queries and failing on demand."""
+
+    def __init__(self, failing_positions: set[int] | None = None, error: Exception | None = None):
+        self.queries: list[str] = []
+        self.failing_positions = failing_positions or set()
+        self.error = error or Exception('index rejected by FalkorDB')
+
+    async def __call__(self, query: str, **kwargs: Any):
+        self.queries.append(query)
+        # Yield so concurrent callers actually get a chance to interleave.
+        await asyncio.sleep(0)
+        if len(self.queries) in self.failing_positions:
+            raise self.error
+        return [], [], None
+
+    @property
+    def index_queries(self) -> list[str]:
+        return [query for query in self.queries if query in INDEX_QUERIES]
+
+
+def build_driver(client: MagicMock | None = None, database: str = 'default_db'):
+    """FalkorDriver wired to a recording executor, with index deletion stubbed out."""
+    client = client if client is not None else MagicMock()
+    driver = FalkorDriver(falkor_db=client, database=database)
+    executor = RecordingExecutor()
+    driver.execute_query = executor  # type: ignore[method-assign]
+    driver.delete_all_indexes = AsyncMock()  # type: ignore[method-assign]
+    return driver, executor
+
+
+@unittest.skipIf(not HAS_FALKORDB, 'FalkorDB is not installed')
+class TestFalkorDriverIndexLifecycle:
+    """Index creation must be caller-driven, resilient, idempotent and loop-agnostic."""
+
+    @pytest.mark.asyncio
+    async def test_construction_schedules_no_background_work(self):
+        """Constructing inside a running loop must not spawn an unsupervised task."""
+        client = MagicMock()
+        client.aclose = AsyncMock()
+        tasks_before = asyncio.all_tasks()
+
+        driver = FalkorDriver(falkor_db=client)
+        await asyncio.sleep(0)
+
+        assert asyncio.all_tasks() == tasks_before
+        client.select_graph.assert_not_called()
+
+        await driver.close()
+        await asyncio.sleep(0)
+
+        assert asyncio.all_tasks() == tasks_before
+
+    @pytest.mark.asyncio
+    async def test_construction_leaves_no_unretrieved_exception(self):
+        """No background work means nothing can die with 'Task exception was never retrieved'."""
+        loop = asyncio.get_running_loop()
+        unhandled: list[dict] = []
+        loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+
+        try:
+            client = MagicMock()
+            client.aclose = AsyncMock()
+            driver = FalkorDriver(falkor_db=client)
+            await driver.close()
+
+            for _ in range(3):
+                await asyncio.sleep(0)
+            gc.collect()
+            await asyncio.sleep(0)
+        finally:
+            loop.set_exception_handler(None)
+
+        assert unhandled == []
+
+    @pytest.mark.asyncio
+    async def test_every_index_is_attempted_when_one_fails(self, caplog):
+        """A rejected index must not hide the twelve queued behind it."""
+        driver, _ = build_driver()
+        executor = RecordingExecutor(failing_positions={2}, error=Exception('boom on index 2'))
+        driver.execute_query = executor  # type: ignore[method-assign]
+
+        with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+            await driver.build_indices_and_constraints()
+
+        assert executor.queries == list(INDEX_QUERIES)
+        assert len(executor.queries) == INDEX_QUERY_COUNT
+        assert RELATES_TO_FULLTEXT_QUERY in executor.queries
+        assert executor.queries[-1] == RELATES_TO_FULLTEXT_QUERY
+
+        warnings = [
+            record.getMessage() for record in caplog.records if record.levelno >= logging.WARNING
+        ]
+        assert any('index on Episodic' in message for message in warnings)
+
+    @pytest.mark.asyncio
+    async def test_partial_failure_does_not_mark_the_build_as_done(self):
+        """A build that lost an index stays retryable instead of caching the hole."""
+        driver, _ = build_driver()
+        executor = RecordingExecutor(failing_positions={2})
+        driver.execute_query = executor  # type: ignore[method-assign]
+
+        await driver.build_indices_and_constraints()
+        await driver.build_indices_and_constraints()
+
+        assert len(executor.queries) == 2 * INDEX_QUERY_COUNT
+
+    @pytest.mark.asyncio
+    async def test_indices_built_reports_a_complete_build(self):
+        """Consumers memoizing the build need to tell a complete one from a partial one."""
+        driver, _ = build_driver()
+        driver.execute_query = RecordingExecutor()  # type: ignore[method-assign]
+
+        assert driver.indices_built is False
+        await driver.build_indices_and_constraints()
+        assert driver.indices_built is True
+
+    @pytest.mark.asyncio
+    async def test_indices_built_stays_false_after_a_partial_build(self):
+        """A missing index must not look like a finished build to the consumer."""
+        driver, _ = build_driver()
+        driver.execute_query = RecordingExecutor(failing_positions={2})  # type: ignore[method-assign]
+
+        await driver.build_indices_and_constraints()
+
+        assert driver.indices_built is False
+
+    @pytest.mark.asyncio
+    async def test_total_failure_raises(self):
+        """Nothing getting through is a dead connection, not a rejected index."""
+        driver, _ = build_driver()
+        executor = RecordingExecutor(
+            failing_positions=set(range(1, INDEX_QUERY_COUNT + 1)),
+            error=ConnectionError('Connection closed by server'),
+        )
+        driver.execute_query = executor  # type: ignore[method-assign]
+
+        with pytest.raises(RuntimeError, match='Failed to create any index'):
+            await driver.build_indices_and_constraints()
+
+        assert len(executor.queries) == INDEX_QUERY_COUNT
+
+    @pytest.mark.asyncio
+    async def test_repeated_build_runs_the_queries_once(self):
+        driver, executor = build_driver()
+
+        await driver.build_indices_and_constraints()
+        await driver.build_indices_and_constraints()
+        await driver.build_indices_and_constraints()
+
+        assert len(executor.queries) == INDEX_QUERY_COUNT
+
+    @pytest.mark.asyncio
+    async def test_delete_existing_forces_a_rebuild(self):
+        driver, executor = build_driver()
+
+        await driver.build_indices_and_constraints()
+        await driver.build_indices_and_constraints(delete_existing=True)
+
+        assert len(executor.queries) == 2 * INDEX_QUERY_COUNT
+        driver.delete_all_indexes.assert_awaited_once()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_concurrent_builds_run_the_queries_once(self):
+        driver, executor = build_driver()
+
+        await asyncio.gather(
+            driver.build_indices_and_constraints(),
+            driver.build_indices_and_constraints(),
+            driver.build_indices_and_constraints(),
+        )
+
+        assert len(executor.queries) == INDEX_QUERY_COUNT
+
+    @pytest.mark.asyncio
+    async def test_driver_instances_sharing_client_and_database_build_once(self):
+        """clone() and per-request drivers reuse the guard instead of re-running the storm."""
+        client = MagicMock()
+        first, first_executor = build_driver(client=client, database='org_42')
+        second, second_executor = build_driver(client=client, database='org_42')
+
+        await first.build_indices_and_constraints()
+        await second.build_indices_and_constraints()
+
+        assert len(first_executor.queries) == INDEX_QUERY_COUNT
+        assert second_executor.queries == []
+
+    @pytest.mark.asyncio
+    async def test_databases_are_guarded_independently(self):
+        """One graph per organisation: building org A must not skip org B."""
+        client = MagicMock()
+        org_a, executor_a = build_driver(client=client, database='org_a')
+        org_b, executor_b = build_driver(client=client, database='org_b')
+
+        await org_a.build_indices_and_constraints()
+        await org_b.build_indices_and_constraints()
+
+        assert len(executor_a.queries) == INDEX_QUERY_COUNT
+        assert len(executor_b.queries) == INDEX_QUERY_COUNT
+
+    @pytest.mark.asyncio
+    async def test_clients_are_guarded_independently(self):
+        first, first_executor = build_driver(client=MagicMock())
+        second, second_executor = build_driver(client=MagicMock())
+
+        await first.build_indices_and_constraints()
+        await second.build_indices_and_constraints()
+
+        assert len(first_executor.queries) == INDEX_QUERY_COUNT
+        assert len(second_executor.queries) == INDEX_QUERY_COUNT
+
+    def test_build_survives_many_event_loops(self):
+        """The worker pattern: one asyncio.run() per job, many loops in one process."""
+        driver, _ = build_driver(database='worker_db')
+        executor = RecordingExecutor()
+        driver.execute_query = executor  # type: ignore[method-assign]
+
+        async def build_twice_concurrently():
+            # Contending for the lock is what forces it to bind to the running loop.
+            await asyncio.gather(
+                driver.build_indices_and_constraints(delete_existing=True),
+                driver.build_indices_and_constraints(delete_existing=True),
+            )
+
+        for expected_runs in (2, 4, 6):
+            asyncio.run(build_twice_concurrently())
+            assert len(executor.queries) == expected_runs * INDEX_QUERY_COUNT
+
+    @pytest.mark.asyncio
+    async def test_index_already_exists_is_tolerated_end_to_end(self):
+        """Wordings execute_query does not swallow are still fine for index creation."""
+        client = MagicMock()
+        graph = MagicMock()
+        graph.query = AsyncMock(side_effect=Exception('Index already exists'))
+        client.select_graph.return_value = graph
+        driver = FalkorDriver(falkor_db=client, database='already_indexed_db')
+
+        await driver.build_indices_and_constraints()
+
+        assert graph.query.await_count == INDEX_QUERY_COUNT
+
+        # The build counts as complete, so it is not retried.
+        await driver.build_indices_and_constraints()
+        assert graph.query.await_count == INDEX_QUERY_COUNT
+
+    @pytest.mark.parametrize(
+        'message',
+        [
+            "Attribute 'name' is already indexed",
+            'Index already exists',
+            'Fulltext index already exists',
+            'Attribute has already been indexed',
+            'ALREADY INDEXED',
+        ],
+    )
+    def test_index_already_exists_error_matches_falkordb_wordings(self, message):
+        assert index_already_exists_error(Exception(message)) is True
+
+    @pytest.mark.parametrize(
+        'message',
+        [
+            'Connection closed by server',
+            'Syntax error at offset 12',
+            'Redis is loading the dataset in memory',
+        ],
+    )
+    def test_index_already_exists_error_rejects_real_failures(self, message):
+        assert index_already_exists_error(Exception(message)) is False
+
+    def test_describe_index_query_names_the_index(self):
+        assert describe_index_query(INDEX_QUERIES[0]) == 'index on Entity'
+        assert describe_index_query(RELATES_TO_FULLTEXT_QUERY) == 'fulltext index on RELATES_TO'
+        assert describe_index_query(INDEX_QUERIES[9]) == 'fulltext index on Episodic'
 
 
 # Simple integration test

@@ -18,7 +18,9 @@ import asyncio
 import datetime
 import logging
 import re
+import threading
 from typing import TYPE_CHECKING, Any
+from weakref import WeakKeyDictionary
 
 if TYPE_CHECKING:
     from falkordb import Graph as FalkorGraph
@@ -71,6 +73,88 @@ from graphiti_core.helpers import validate_group_ids
 from graphiti_core.utils.datetime_utils import convert_datetimes_to_strings
 
 logger = logging.getLogger(__name__)
+
+# FalkorDB has no CREATE INDEX ... IF NOT EXISTS, so re-creating an index is reported as an
+# error whose wording depends on the index kind and the server version ("Attribute 'x' is
+# already indexed", "Index already exists", ...). Matching "already indexed"/"already exists"
+# instead of one literal substring keeps index creation tolerant across those variants.
+_INDEX_ALREADY_EXISTS_PATTERN = re.compile(r'already\s+(?:been\s+)?(?:index|exist)', re.IGNORECASE)
+
+_INDEX_LABEL_PATTERN = re.compile(r"label:\s*'([^']+)'")
+_INDEX_ENTITY_PATTERN = re.compile(r'[(\[][ne]:(\w+)')
+
+# Guards index creation per (FalkorDB client, database). Keyed weakly so that drivers and
+# their clients stay collectable; the mutex is a plain threading lock because the registry is
+# also read from worker threads that each drive their own event loop.
+_INDEX_STATE_MUTEX = threading.RLock()
+_INDEX_STATE: 'WeakKeyDictionary[Any, dict[str, _IndexBuildState]]' = WeakKeyDictionary()
+
+
+def index_already_exists_error(error: BaseException) -> bool:
+    """Whether a FalkorDB error only means the index is already there."""
+    return _INDEX_ALREADY_EXISTS_PATTERN.search(str(error)) is not None
+
+
+def describe_index_query(query: str) -> str:
+    """Short log-friendly identifier for an index creation query."""
+    collapsed = ' '.join(query.split())
+    kind = 'fulltext index' if 'FULLTEXT' in collapsed.upper() else 'index'
+
+    label_match = _INDEX_LABEL_PATTERN.search(collapsed)
+    if label_match:
+        return f'{kind} on {label_match.group(1)}'
+
+    entity_match = _INDEX_ENTITY_PATTERN.search(collapsed)
+    if entity_match:
+        return f'{kind} on {entity_match.group(1)}'
+
+    return collapsed[:100]
+
+
+class _IndexBuildState:
+    """Bookkeeping shared by every driver pointing at the same (client, database)."""
+
+    __slots__ = ('built', '_locks')
+
+    def __init__(self) -> None:
+        self.built = False
+        self._locks: list[tuple[asyncio.AbstractEventLoop, asyncio.Lock]] = []
+
+    def lock_for_running_loop(self) -> asyncio.Lock:
+        """Return the lock bound to the running loop, creating it on first use there.
+
+        An asyncio.Lock binds itself to whichever loop first awaits it, so a single shared
+        lock would raise "attached to a different loop" as soon as the process starts a
+        second loop. Workers call asyncio.run() once per job, i.e. many short-lived loops in
+        one process, so a lock is kept per live loop instead. Closed loops are pruned on
+        access, which keeps the list at one entry per loop actually running right now.
+        """
+        loop = asyncio.get_running_loop()
+        with _INDEX_STATE_MUTEX:
+            self._locks = [entry for entry in self._locks if not entry[0].is_closed()]
+            for bound_loop, lock in self._locks:
+                if bound_loop is loop:
+                    return lock
+
+            lock = asyncio.Lock()
+            self._locks.append((loop, lock))
+            return lock
+
+
+def _get_index_build_state(client: Any, database: str) -> _IndexBuildState:
+    with _INDEX_STATE_MUTEX:
+        try:
+            per_database = _INDEX_STATE.setdefault(client, {})
+        except TypeError:
+            # Client cannot be weakly referenced: fall back to state attached to the client.
+            per_database = client.__dict__.setdefault('_graphiti_index_build_state', {})
+
+        state = per_database.get(database)
+        if state is None:
+            state = _IndexBuildState()
+            per_database[database] = state
+
+        return state
 
 
 def _strip_nul_bytes(value: Any) -> Any:
@@ -173,15 +257,11 @@ class FalkorDriver(GraphDriver):
         self._search_ops = FalkorSearchOperations()
         self._graph_ops = FalkorGraphMaintenanceOperations()
 
-        # Schedule the indices and constraints to be built
-        try:
-            # Try to get the current event loop
-            loop = asyncio.get_running_loop()
-            # Schedule the build_indices_and_constraints to run
-            loop.create_task(self.build_indices_and_constraints())
-        except RuntimeError:
-            # No event loop running, this will be handled later
-            pass
+        # Index creation is NOT scheduled here. Constructing a driver must not start
+        # unsupervised work: a fire-and-forget task outlives close(), dies with
+        # "Task exception was never retrieved", and turns every instantiation into a write
+        # storm against FalkorDB. Callers own the lifecycle and await
+        # build_indices_and_constraints() explicitly (it is idempotent, see below).
 
     # --- Operations properties ---
 
@@ -313,12 +393,76 @@ class FalkorDriver(GraphDriver):
         if drop_tasks:
             await asyncio.gather(*drop_tasks)
 
-    async def build_indices_and_constraints(self, delete_existing=False):
-        if delete_existing:
-            await self.delete_all_indexes()
-        index_queries = get_range_indices(self.provider) + get_fulltext_indices(self.provider)
-        for query in index_queries:
+    @property
+    def indices_built(self) -> bool:
+        """Whether the last build left every index for this database in place."""
+        return _get_index_build_state(self.client, self._database).built
+
+    async def _execute_index_query(self, query: str) -> bool:
+        """Execute one index creation query, reporting whether the index ended up in place."""
+        try:
             await self.execute_query(query)
+            return True
+        except Exception as e:
+            if index_already_exists_error(e):
+                logger.debug(
+                    'Index already exists on %s: %s', self._database, describe_index_query(query)
+                )
+                return True
+
+            logger.warning(
+                'Could not create %s on FalkorDB database %s: %s',
+                describe_index_query(query),
+                self._database,
+                e,
+            )
+            return False
+
+    async def build_indices_and_constraints(self, delete_existing=False):
+        """Create the range and fulltext indices, tolerating individual failures.
+
+        Every query is attempted even if an earlier one failed, so a rejected index never
+        hides the ones queued behind it. A completed build is remembered per
+        (client, database), so repeat calls are free; `delete_existing` forces a rebuild.
+        """
+        state = _get_index_build_state(self.client, self._database)
+
+        async with state.lock_for_running_loop():
+            if state.built and not delete_existing:
+                logger.debug('Indices already built for FalkorDB database %s', self._database)
+                return
+
+            if delete_existing:
+                state.built = False
+                await self.delete_all_indexes()
+
+            index_queries = get_range_indices(self.provider) + get_fulltext_indices(self.provider)
+            failed = [
+                query for query in index_queries if not await self._execute_index_query(query)
+            ]
+
+            if not failed:
+                state.built = True
+                return
+
+            if len(failed) == len(index_queries):
+                # Nothing at all got through: this is a dead connection or an unusable
+                # database, not a rejected index, and the caller must hear about it.
+                raise RuntimeError(
+                    f'Failed to create any index on FalkorDB database {self._database} '
+                    f'({len(failed)} queries failed); see warnings above'
+                )
+
+            # Partial failure: the graph stays usable, searches backed by the missing indices
+            # do not. Surface it loudly but do not abort the caller's start-up, and leave the
+            # build unmarked so a later call retries the missing ones.
+            logger.error(
+                'Built FalkorDB indices on %s with %d of %d failures: %s',
+                self._database,
+                len(failed),
+                len(index_queries),
+                ', '.join(describe_index_query(query) for query in failed),
+            )
 
     def clone(self, database: str) -> 'GraphDriver':
         """

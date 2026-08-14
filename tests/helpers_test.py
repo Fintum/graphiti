@@ -120,6 +120,8 @@ async def graph_driver(request):
     driver = request.param
     graph_driver = get_driver(driver)
     await clear_data(graph_driver, [group_id, group_id_2])
+    # Drivers no longer build indices behind the caller's back on construction.
+    await graph_driver.build_indices_and_constraints()
     try:
         yield graph_driver  # provide driver to the test
     finally:
