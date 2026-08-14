@@ -92,10 +92,10 @@ def split_episode(episode: EpisodicNode) -> list[dict]:
     episode_tasks = episode.model_copy()
     episode_participants = episode.model_copy()
 
-    episode_main.content = json.dumps(content_main)
-    episode_chapters.content = json.dumps(content_chapters)
-    episode_tasks.content = json.dumps(content_tasks)
-    episode_participants.content = json.dumps(content_participants)
+    episode_main.content = json.dumps(content_main, ensure_ascii=False)
+    episode_chapters.content = json.dumps(content_chapters, ensure_ascii=False)
+    episode_tasks.content = json.dumps(content_tasks, ensure_ascii=False)
+    episode_participants.content = json.dumps(content_participants, ensure_ascii=False)
 
     return [
         {"episode": episode_participants, "name": "participants", "is_empty": content_participants is None, "entities": ["Person"]}, 
