@@ -838,11 +838,16 @@ async def test_add_triplet_edge_uuid_with_same_nodes_updates_edge(
         created_at=now,
     )
 
+    # This is the only case here where the node pair already has an edge, so the
+    # duplicate-candidate search actually runs; patching only `search` would let it
+    # through to the live driver and the embedder.
     with (
         patch('graphiti_core.graphiti.search') as mock_search,
+        patch('graphiti_core.graphiti.search_related_edges') as mock_search_related,
         patch('graphiti_core.graphiti.resolve_extracted_edge') as mock_resolve_edge,
     ):
         mock_search.return_value = Mock(edges=[])
+        mock_search_related.return_value = Mock(edges=[])
         mock_resolve_edge.return_value = (updated_edge, [], [])
 
         result = await graphiti.add_triplet(alice, updated_edge, bob)

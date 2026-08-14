@@ -322,6 +322,26 @@ async def extract_edges(
     return edges
 
 
+async def search_related_edges(
+    clients: GraphitiClients,
+    extracted_edge: EntityEdge,
+    candidate_edges: list[EntityEdge],
+) -> SearchResults:
+    """Search for edges related to an extracted edge, skipping the query when there are no candidates."""
+    if not candidate_edges:
+        # An empty edge_uuids filter is unsatisfiable, so the search would always
+        # return nothing; skip the round trip to the graph database entirely.
+        return SearchResults()
+
+    return await search(
+        clients,
+        extracted_edge.fact,
+        group_ids=[extracted_edge.group_id],
+        config=EDGE_HYBRID_SEARCH_RRF,
+        search_filter=SearchFilters(edge_uuids=[edge.uuid for edge in candidate_edges]),
+    )
+
+
 async def resolve_extracted_edges(
     clients: GraphitiClients,
     extracted_edges: list[EntityEdge],
@@ -391,13 +411,7 @@ async def resolve_extracted_edges(
 
     related_edges_results: list[SearchResults] = await semaphore_gather(
         *[
-            search(
-                clients,
-                extracted_edge.fact,
-                group_ids=[extracted_edge.group_id],
-                config=EDGE_HYBRID_SEARCH_RRF,
-                search_filter=SearchFilters(edge_uuids=[edge.uuid for edge in valid_edges]),
-            )
+            search_related_edges(clients, extracted_edge, valid_edges)
             for extracted_edge, valid_edges in zip(extracted_edges, valid_edges_list, strict=True)
         ]
     )

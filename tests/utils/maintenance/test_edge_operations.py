@@ -8,10 +8,12 @@ from pydantic import BaseModel
 from graphiti_core.edges import EntityEdge
 from graphiti_core.nodes import EntityNode, EpisodicNode
 from graphiti_core.search.search_config import SearchResults
+from graphiti_core.search.search_filters import SearchFilters
 from graphiti_core.utils.maintenance.edge_operations import (
     extract_edges,
     resolve_extracted_edge,
     resolve_extracted_edges,
+    search_related_edges,
 )
 
 
@@ -771,3 +773,240 @@ async def test_resolve_extracted_edge_overcap_attribute_preserves_prior(monkeypa
     assert resolved.attributes['is_current'] == 'true'
     assert dupes == []
     assert invalidated == []
+
+
+def _entity_edge(source_uuid: str, target_uuid: str, fact: str) -> EntityEdge:
+    return EntityEdge(
+        source_node_uuid=source_uuid,
+        target_node_uuid=target_uuid,
+        name='RELATES',
+        group_id='group_1',
+        fact=fact,
+        episodes=[],
+        created_at=datetime.now(timezone.utc),
+        valid_at=None,
+        invalid_at=None,
+    )
+
+
+def _entity_node(uuid: str) -> EntityNode:
+    return EntityNode(uuid=uuid, name=f'Node {uuid}', group_id='group_1', labels=['Entity'])
+
+
+def _episode() -> EpisodicNode:
+    return EpisodicNode(
+        uuid='episode_uuid',
+        name='Episode',
+        group_id='group_1',
+        source='message',
+        source_description='desc',
+        content='Episode content',
+        valid_at=datetime.now(timezone.utc),
+    )
+
+
+def _mock_clients() -> SimpleNamespace:
+    return SimpleNamespace(
+        driver=MagicMock(),
+        llm_client=MagicMock(),
+        embedder=MagicMock(),
+        cross_encoder=MagicMock(),
+    )
+
+
+def _patch_resolve_extracted_edges_deps(monkeypatch, candidates_by_pair, related_by_fact):
+    """Wire resolve_extracted_edges onto in-memory stubs and return (search spy, observed pairings)."""
+    from graphiti_core.utils.maintenance import edge_operations as edge_ops
+
+    monkeypatch.setattr(edge_ops, 'create_entity_edge_embeddings', AsyncMock(return_value=None))
+
+    async def immediate_gather(*aws, max_coroutines=None):
+        return [await aw for aw in aws]
+
+    monkeypatch.setattr(edge_ops, 'semaphore_gather', immediate_gather)
+
+    async def fake_get_between_nodes(driver, source_node_uuid, target_node_uuid):
+        return list(candidates_by_pair[(source_node_uuid, target_node_uuid)])
+
+    monkeypatch.setattr(EntityEdge, 'get_between_nodes', fake_get_between_nodes)
+
+    async def fake_search(clients, query, group_ids=None, config=None, search_filter=None):
+        if search_filter is not None and search_filter.edge_uuids is not None:
+            return SearchResults(edges=list(related_by_fact.get(query, [])))
+        return SearchResults()
+
+    search_spy = AsyncMock(side_effect=fake_search)
+    monkeypatch.setattr(edge_ops, 'search', search_spy)
+
+    observed: list[tuple[str, list[str]]] = []
+
+    async def record_resolve(
+        llm_client,
+        extracted_edge,
+        related_edges,
+        existing_edges,
+        episode,
+        edge_type_candidates=None,
+    ):
+        observed.append((extracted_edge.uuid, [edge.uuid for edge in related_edges]))
+        return extracted_edge, [], []
+
+    monkeypatch.setattr(edge_ops, 'resolve_extracted_edge', record_resolve)
+
+    return search_spy, observed
+
+
+@pytest.mark.asyncio
+async def test_search_related_edges_skips_query_without_candidates(monkeypatch):
+    """An empty edge_uuids filter can never match, so no search may be issued at all."""
+    from graphiti_core.utils.maintenance import edge_operations as edge_ops
+
+    search_spy = AsyncMock(return_value=SearchResults())
+    monkeypatch.setattr(edge_ops, 'search', search_spy)
+
+    results = await search_related_edges(
+        _mock_clients(), _entity_edge('n1', 'n2', 'alice works at acme'), []
+    )
+
+    assert search_spy.await_count == 0
+    # Equivalent to what the unsatisfiable filtered search would have returned.
+    assert results == SearchResults()
+    assert results.edges == []
+    assert results.nodes == []
+    assert results.episodes == []
+    assert results.communities == []
+
+
+@pytest.mark.asyncio
+async def test_search_related_edges_queries_with_candidate_uuids(monkeypatch):
+    """With candidates present the filtered search must still be issued unchanged."""
+    from graphiti_core.utils.maintenance import edge_operations as edge_ops
+
+    candidate = _entity_edge('n1', 'n2', 'alice worked at acme')
+    expected = SearchResults(edges=[candidate])
+    search_spy = AsyncMock(return_value=expected)
+    monkeypatch.setattr(edge_ops, 'search', search_spy)
+
+    extracted_edge = _entity_edge('n1', 'n2', 'alice works at acme')
+    results = await search_related_edges(_mock_clients(), extracted_edge, [candidate])
+
+    assert results is expected
+    assert search_spy.await_count == 1
+    assert search_spy.await_args.kwargs['search_filter'] == SearchFilters(
+        edge_uuids=[candidate.uuid]
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_extracted_edges_issues_no_filtered_search_for_new_node_pairs(monkeypatch):
+    """New node pairs have no candidates, so no edge_uuids-filtered search may reach the graph."""
+    edge_a = _entity_edge('n1', 'n2', 'alice works at acme')
+    edge_b = _entity_edge('n3', 'n4', 'bob lives in berlin')
+    candidates_by_pair = {('n1', 'n2'): [], ('n3', 'n4'): []}
+
+    search_spy, observed = _patch_resolve_extracted_edges_deps(monkeypatch, candidates_by_pair, {})
+
+    resolved_edges, invalidated_edges, new_edges = await resolve_extracted_edges(
+        _mock_clients(),
+        [edge_a, edge_b],
+        _episode(),
+        [_entity_node(uuid) for uuid in ('n1', 'n2', 'n3', 'n4')],
+        {},
+        {},
+    )
+
+    edge_uuid_filters = [
+        call.kwargs['search_filter'].edge_uuids for call in search_spy.await_args_list
+    ]
+    # Not a single search carries an (unsatisfiable) edge_uuids filter...
+    assert [f for f in edge_uuid_filters if f is not None] == []
+    # ...so only the unfiltered invalidation-candidate pass runs: N queries instead of 2N.
+    assert search_spy.await_count == 2
+
+    # And the outcome is exactly what the unsatisfiable search would have produced.
+    assert observed == [(edge_a.uuid, []), (edge_b.uuid, [])]
+    assert [edge.uuid for edge in resolved_edges] == [edge_a.uuid, edge_b.uuid]
+    assert invalidated_edges == []
+    assert new_edges == resolved_edges
+
+
+@pytest.mark.asyncio
+async def test_resolve_extracted_edges_filters_search_by_candidate_uuids(monkeypatch):
+    """When candidates exist the filtered search keeps running with their uuids."""
+    extracted_edge = _entity_edge('n1', 'n2', 'alice works at acme')
+    candidate_one = _entity_edge('n1', 'n2', 'alice worked at acme')
+    candidate_two = _entity_edge('n1', 'n2', 'alice joined acme')
+    candidates_by_pair = {('n1', 'n2'): [candidate_one, candidate_two]}
+    related_by_fact = {'alice works at acme': [candidate_one]}
+
+    search_spy, observed = _patch_resolve_extracted_edges_deps(
+        monkeypatch, candidates_by_pair, related_by_fact
+    )
+
+    await resolve_extracted_edges(
+        _mock_clients(),
+        [extracted_edge],
+        _episode(),
+        [_entity_node('n1'), _entity_node('n2')],
+        {},
+        {},
+    )
+
+    filtered_calls = [
+        call
+        for call in search_spy.await_args_list
+        if call.kwargs['search_filter'].edge_uuids is not None
+    ]
+    assert len(filtered_calls) == 1
+    assert filtered_calls[0].args[1] == 'alice works at acme'
+    assert filtered_calls[0].kwargs['search_filter'] == SearchFilters(
+        edge_uuids=[candidate_one.uuid, candidate_two.uuid]
+    )
+    assert observed == [(extracted_edge.uuid, [candidate_one.uuid])]
+
+
+@pytest.mark.asyncio
+async def test_resolve_extracted_edges_pairs_each_result_with_its_own_edge(monkeypatch):
+    """Mixed candidate/no-candidate edges keep result order and per-edge correspondence."""
+    edge_a = _entity_edge('n1', 'n2', 'alice works at acme')
+    edge_b = _entity_edge('n3', 'n4', 'bob lives in berlin')
+    edge_c = _entity_edge('n1', 'n4', 'alice knows dave')
+    candidate_a = _entity_edge('n1', 'n2', 'alice worked at acme')
+    candidate_c = _entity_edge('n1', 'n4', 'alice met dave')
+
+    candidates_by_pair = {
+        ('n1', 'n2'): [candidate_a],
+        ('n3', 'n4'): [],
+        ('n1', 'n4'): [candidate_c],
+    }
+    related_by_fact = {
+        'alice works at acme': [candidate_a],
+        'alice knows dave': [candidate_c],
+    }
+
+    search_spy, observed = _patch_resolve_extracted_edges_deps(
+        monkeypatch, candidates_by_pair, related_by_fact
+    )
+
+    extracted_edges = [edge_a, edge_b, edge_c]
+    resolved_edges, _, _ = await resolve_extracted_edges(
+        _mock_clients(),
+        extracted_edges,
+        _episode(),
+        [_entity_node(uuid) for uuid in ('n1', 'n2', 'n3', 'n4')],
+        {},
+        {},
+    )
+
+    assert len(observed) == len(extracted_edges)
+    assert observed == [
+        (edge_a.uuid, [candidate_a.uuid]),
+        (edge_b.uuid, []),
+        (edge_c.uuid, [candidate_c.uuid]),
+    ]
+    assert [edge.uuid for edge in resolved_edges] == [edge.uuid for edge in extracted_edges]
+    # The skipped edge never contributed an unsatisfiable filter.
+    edge_uuid_filters = [
+        call.kwargs['search_filter'].edge_uuids for call in search_spy.await_args_list
+    ]
+    assert [] not in edge_uuid_filters

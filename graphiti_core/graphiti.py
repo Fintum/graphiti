@@ -94,6 +94,7 @@ from graphiti_core.utils.maintenance.edge_operations import (
     extract_edges,
     resolve_extracted_edge,
     resolve_extracted_edges,
+    search_related_edges,
 )
 from graphiti_core.utils.maintenance.graph_data_operations import (
     EPISODE_WINDOW_LEN,
@@ -1947,15 +1948,7 @@ class Graphiti:
             self.driver, edge.source_node_uuid, edge.target_node_uuid
         )
 
-        related_edges = (
-            await search(
-                self.clients,
-                edge.fact,
-                group_ids=[edge.group_id],
-                config=EDGE_HYBRID_SEARCH_RRF,
-                search_filter=SearchFilters(edge_uuids=[edge.uuid for edge in valid_edges]),
-            )
-        ).edges
+        related_edges = (await search_related_edges(self.clients, edge, valid_edges)).edges
         existing_edges = (
             await search(
                 self.clients,
