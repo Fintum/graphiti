@@ -584,6 +584,15 @@ class TestFalkorDriverIndexLifecycle:
         driver.delete_all_indexes.assert_awaited_once()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
+    async def test_vector_dimension_adds_the_vector_indices(self):
+        """A caller-supplied embedder dimension is what turns on the two FalkorDB vector indices."""
+        driver, executor = build_driver()
+
+        await driver.build_indices_and_constraints(vector_dimension=1024)
+
+        assert len(executor.queries) == INDEX_QUERY_COUNT + 2
+
+    @pytest.mark.asyncio
     async def test_concurrent_builds_run_the_queries_once(self):
         driver, executor = build_driver()
 

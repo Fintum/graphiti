@@ -32,6 +32,7 @@ from graphiti_core.graph_queries import (
     get_nodes_query,
     get_relationships_query,
     get_vector_cosine_func_query,
+    vector_k,
 )
 from graphiti_core.helpers import (
     lucene_sanitize,
@@ -39,11 +40,16 @@ from graphiti_core.helpers import (
     semaphore_gather,
     validate_group_ids,
 )
-from graphiti_core.models.edges.edge_db_queries import get_entity_edge_return_query
+from graphiti_core.models.edges.edge_db_queries import (
+    get_entity_edge_return_query,
+    get_falkordb_edge_fulltext_query,
+    get_falkordb_edge_vector_query,
+)
 from graphiti_core.models.nodes.node_db_queries import (
     COMMUNITY_NODE_RETURN,
     EPISODIC_NODE_RETURN,
     get_entity_node_return_query,
+    get_falkordb_node_vector_query,
 )
 from graphiti_core.nodes import (
     CommunityNode,
@@ -200,6 +206,22 @@ async def edge_fulltext_search(
     if fuzzy_query == '':
         return []
 
+    if driver.provider == GraphProvider.FALKORDB:
+        filter_queries, filter_params = edge_search_filter_query_constructor(
+            search_filter, driver.provider
+        )
+        if group_ids is not None:
+            filter_queries.append('e.group_id IN $group_ids')
+            filter_params['group_ids'] = group_ids
+        records, _, _ = await driver.execute_query(
+            get_falkordb_edge_fulltext_query(filter_queries),
+            query=fuzzy_query,
+            limit=limit,
+            routing_='r',
+            **filter_params,
+        )
+        return [get_entity_edge_from_record(record, driver.provider) for record in records]
+
     match_query = """
     YIELD relationship AS rel, score
     MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity)
@@ -342,6 +364,17 @@ async def edge_similarity_search(
         if target_node_uuid is not None:
             filter_params['target_uuid'] = target_node_uuid
             filter_queries.append('m.uuid = $target_uuid')
+
+    if driver.provider == GraphProvider.FALKORDB:
+        records, _, _ = await driver.execute_query(
+            get_falkordb_edge_vector_query(filter_queries, vector_k(limit)),
+            search_vector=search_vector,
+            limit=limit,
+            min_score=min_score,
+            routing_='r',
+            **filter_params,
+        )
+        return [get_entity_edge_from_record(record, driver.provider) for record in records]
 
     filter_query = ''
     if filter_queries:
@@ -689,6 +722,17 @@ async def node_similarity_search(
     if group_ids is not None:
         filter_queries.append('n.group_id IN $group_ids')
         filter_params['group_ids'] = group_ids
+
+    if driver.provider == GraphProvider.FALKORDB:
+        records, _, _ = await driver.execute_query(
+            get_falkordb_node_vector_query(filter_queries, vector_k(limit)),
+            search_vector=search_vector,
+            limit=limit,
+            min_score=min_score,
+            routing_='r',
+            **filter_params,
+        )
+        return [get_entity_node_from_record(record, driver.provider) for record in records]
 
     filter_query = ''
     if filter_queries:

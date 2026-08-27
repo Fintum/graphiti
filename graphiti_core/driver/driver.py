@@ -125,7 +125,9 @@ class GraphDriver(QueryExecutor, ABC):
         return cloned
 
     @abstractmethod
-    async def build_indices_and_constraints(self, delete_existing: bool = False):
+    async def build_indices_and_constraints(
+        self, delete_existing: bool = False, vector_dimension: int | None = None
+    ):
         raise NotImplementedError()
 
     def clone(self, database: str) -> GraphDriver:

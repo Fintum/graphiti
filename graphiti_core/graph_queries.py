@@ -116,7 +116,8 @@ def get_fulltext_indices(provider: GraphProvider) -> list[LiteralString]:
                                                 }},
                                                 'name', 'group_id'
                                                 )""",
-                """CREATE FULLTEXT INDEX FOR ()-[e:RELATES_TO]-() ON (e.name, e.fact, e.group_id)""",
+                f"""CREATE FULLTEXT INDEX FOR ()-[e:RELATES_TO]-() ON (e.name, e.fact, e.group_id)
+                                                OPTIONS {{stopwords: {stopwords_str}}}""",
             ],
         )
 
@@ -138,6 +139,32 @@ def get_fulltext_indices(provider: GraphProvider) -> list[LiteralString]:
         """CREATE FULLTEXT INDEX edge_name_and_fact IF NOT EXISTS
         FOR ()-[e:RELATES_TO]-() ON EACH [e.name, e.fact, e.group_id]""",
     ]
+
+
+VECTOR_K_OVERFETCH = 4
+MIN_VECTOR_K = 20
+
+
+def vector_k(limit: int) -> int:
+    """Group and score filters run after the kNN, so ask the index for more neighbours than the caller wants."""
+    return max(limit * VECTOR_K_OVERFETCH, MIN_VECTOR_K)
+
+
+def get_vector_indices(provider: GraphProvider, dimension: int) -> list[LiteralString]:
+    """Only FalkorDB needs explicit vector indices; the other providers index embeddings on their own."""
+    if provider != GraphProvider.FALKORDB:
+        return []
+    from typing import cast
+
+    return cast(
+        list[LiteralString],
+        [
+            f"CREATE VECTOR INDEX FOR ()-[e:RELATES_TO]-() ON (e.fact_embedding) "
+            f"OPTIONS {{dimension:{dimension}, similarityFunction:'cosine'}}",
+            f"CREATE VECTOR INDEX FOR (n:Entity) ON (n.name_embedding) "
+            f"OPTIONS {{dimension:{dimension}, similarityFunction:'cosine'}}",
+        ],
+    )
 
 
 def get_nodes_query(name: str, query: str, limit: int, provider: GraphProvider) -> str:

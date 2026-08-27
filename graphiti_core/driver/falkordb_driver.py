@@ -68,7 +68,7 @@ from graphiti_core.driver.operations.has_episode_edge_ops import HasEpisodeEdgeO
 from graphiti_core.driver.operations.next_episode_edge_ops import NextEpisodeEdgeOperations
 from graphiti_core.driver.operations.saga_node_ops import SagaNodeOperations
 from graphiti_core.driver.operations.search_ops import SearchOperations
-from graphiti_core.graph_queries import get_fulltext_indices, get_range_indices
+from graphiti_core.graph_queries import get_fulltext_indices, get_range_indices, get_vector_indices
 from graphiti_core.helpers import validate_group_ids
 from graphiti_core.utils.datetime_utils import convert_datetimes_to_strings
 
@@ -418,8 +418,10 @@ class FalkorDriver(GraphDriver):
             )
             return False
 
-    async def build_indices_and_constraints(self, delete_existing=False):
-        """Create the range and fulltext indices, tolerating individual failures.
+    async def build_indices_and_constraints(
+        self, delete_existing: bool = False, vector_dimension: int | None = None
+    ):
+        """Create the range, fulltext and vector indices, tolerating individual failures.
 
         Every query is attempted even if an earlier one failed, so a rejected index never
         hides the ones queued behind it. A completed build is remembered per
@@ -436,7 +438,11 @@ class FalkorDriver(GraphDriver):
                 state.built = False
                 await self.delete_all_indexes()
 
-            index_queries = get_range_indices(self.provider) + get_fulltext_indices(self.provider)
+            index_queries = (
+                get_range_indices(self.provider)
+                + get_fulltext_indices(self.provider)
+                + (get_vector_indices(self.provider, vector_dimension) if vector_dimension else [])
+            )
             failed = [
                 query for query in index_queries if not await self._execute_index_query(query)
             ]

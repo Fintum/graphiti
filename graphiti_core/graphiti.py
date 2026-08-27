@@ -602,7 +602,9 @@ class Graphiti:
         Caution: Running this method on a large existing database may take some time
         and could impact database performance during execution.
         """
-        await self.driver.build_indices_and_constraints(delete_existing)
+        embedder_config = getattr(self.embedder, 'config', None)
+        vector_dimension = getattr(embedder_config, 'embedding_dim', None)
+        await self.driver.build_indices_and_constraints(delete_existing, vector_dimension=vector_dimension)
 
     async def _extract_and_resolve_nodes(
         self,

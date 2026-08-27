@@ -318,3 +318,45 @@ NEXT_EPISODE_EDGE_RETURN = """
     m.uuid AS target_node_uuid,
     e.created_at AS created_at
 """
+
+
+def _where(filter_queries: list[str]) -> str:
+    return (' WHERE ' + ' AND '.join(filter_queries)) if filter_queries else ''
+
+
+def get_falkordb_edge_fulltext_query(filter_queries: list[str]) -> str:
+    """Endpoints come from startNode/endNode of the yielded relationship, never from a re-MATCH."""
+    return (
+        """
+    CALL db.idx.fulltext.queryRelationships('RELATES_TO', $query)
+    YIELD relationship AS e, score
+    WITH e, score, startNode(e) AS n, endNode(e) AS m"""
+        + _where(filter_queries)
+        + """
+    WITH e, score, n, m
+    ORDER BY score DESC
+    LIMIT $limit
+    RETURN
+    """
+        + get_entity_edge_return_query(GraphProvider.FALKORDB)
+    )
+
+
+def get_falkordb_edge_vector_query(filter_queries: list[str], k: int) -> str:
+    """Indexed kNN over fact_embedding; the procedure returns cosine distance, mapped to the (2 - d) / 2 similarity used everywhere else."""
+    conditions = ['score > $min_score', *filter_queries]
+    return (
+        f"""
+    CALL db.idx.vector.queryRelationships('RELATES_TO', 'fact_embedding', {k}, vecf32($search_vector))
+    YIELD relationship AS e, score AS distance
+    WITH e, (2 - distance) / 2 AS score, startNode(e) AS n, endNode(e) AS m
+    WHERE """
+        + ' AND '.join(conditions)
+        + """
+    WITH e, score, n, m
+    ORDER BY score DESC
+    LIMIT $limit
+    RETURN
+    """
+        + get_entity_edge_return_query(GraphProvider.FALKORDB)
+    )

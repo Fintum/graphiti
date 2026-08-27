@@ -29,16 +29,17 @@ from graphiti_core.driver.record_parsers import (
     episodic_node_from_record,
 )
 from graphiti_core.edges import EntityEdge
-from graphiti_core.graph_queries import (
-    get_nodes_query,
-    get_relationships_query,
-    get_vector_cosine_func_query,
+from graphiti_core.graph_queries import get_nodes_query, get_vector_cosine_func_query, vector_k
+from graphiti_core.models.edges.edge_db_queries import (
+    get_entity_edge_return_query,
+    get_falkordb_edge_fulltext_query,
+    get_falkordb_edge_vector_query,
 )
-from graphiti_core.models.edges.edge_db_queries import get_entity_edge_return_query
 from graphiti_core.models.nodes.node_db_queries import (
     COMMUNITY_NODE_RETURN,
     EPISODIC_NODE_RETURN,
     get_entity_node_return_query,
+    get_falkordb_node_vector_query,
 )
 from graphiti_core.nodes import CommunityNode, EntityNode, EpisodicNode
 from graphiti_core.search.search_filters import (
@@ -200,31 +201,8 @@ class FalkorSearchOperations(SearchOperations):
             filter_queries.append('n.group_id IN $group_ids')
             filter_params['group_ids'] = group_ids
 
-        filter_query = ''
-        if filter_queries:
-            filter_query = ' WHERE ' + (' AND '.join(filter_queries))
-
-        cypher = (
-            'MATCH (n:Entity)'
-            + filter_query
-            + """
-            WITH n, """
-            + get_vector_cosine_func_query(
-                'n.name_embedding', '$search_vector', GraphProvider.FALKORDB
-            )
-            + """ AS score
-            WHERE score > $min_score
-            RETURN
-            """
-            + get_entity_node_return_query(GraphProvider.FALKORDB)
-            + """
-            ORDER BY score DESC
-            LIMIT $limit
-            """
-        )
-
         records, _, _ = await executor.execute_query(
-            cypher,
+            get_falkordb_node_vector_query(filter_queries, vector_k(limit)),
             search_vector=search_vector,
             limit=limit,
             min_score=min_score,
@@ -305,32 +283,8 @@ class FalkorSearchOperations(SearchOperations):
             filter_queries.append('e.group_id IN $group_ids')
             filter_params['group_ids'] = group_ids
 
-        filter_query = ''
-        if filter_queries:
-            filter_query = ' WHERE ' + (' AND '.join(filter_queries))
-
-        cypher = (
-            get_relationships_query(
-                'edge_name_and_fact', limit=limit, provider=GraphProvider.FALKORDB
-            )
-            + """
-            YIELD relationship AS rel, score
-            MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity)
-            """
-            + filter_query
-            + """
-            WITH e, score, n, m
-            RETURN
-            """
-            + get_entity_edge_return_query(GraphProvider.FALKORDB)
-            + """
-            ORDER BY score DESC
-            LIMIT $limit
-            """
-        )
-
         records, _, _ = await executor.execute_query(
-            cypher,
+            get_falkordb_edge_fulltext_query(filter_queries),
             query=fuzzy_query,
             limit=limit,
             **filter_params,
@@ -365,31 +319,8 @@ class FalkorSearchOperations(SearchOperations):
                 filter_params['target_uuid'] = target_node_uuid
                 filter_queries.append('m.uuid = $target_uuid')
 
-        filter_query = ''
-        if filter_queries:
-            filter_query = ' WHERE ' + (' AND '.join(filter_queries))
-
-        cypher = (
-            'MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)'
-            + filter_query
-            + """
-            WITH DISTINCT e, n, m, """
-            + get_vector_cosine_func_query(
-                'e.fact_embedding', '$search_vector', GraphProvider.FALKORDB
-            )
-            + """ AS score
-            WHERE score > $min_score
-            RETURN
-            """
-            + get_entity_edge_return_query(GraphProvider.FALKORDB)
-            + """
-            ORDER BY score DESC
-            LIMIT $limit
-            """
-        )
-
         records, _, _ = await executor.execute_query(
-            cypher,
+            get_falkordb_edge_vector_query(filter_queries, vector_k(limit)),
             search_vector=search_vector,
             limit=limit,
             min_score=min_score,

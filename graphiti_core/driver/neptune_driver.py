@@ -333,7 +333,9 @@ class NeptuneDriver(GraphDriver):
             if client.indices.exists(index=index_name):
                 client.indices.delete(index=index_name)
 
-    async def build_indices_and_constraints(self, delete_existing: bool = False):
+    async def build_indices_and_constraints(
+        self, delete_existing: bool = False, vector_dimension: int | None = None
+    ):
         # Neptune uses OpenSearch (AOSS) for indexing
         if delete_existing:
             await self.delete_aoss_indices()

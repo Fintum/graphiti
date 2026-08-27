@@ -392,3 +392,24 @@ SAGA_NODE_RETURN_NEPTUNE = """
     s.last_summarized_at AS last_summarized_at,
     s.last_summarized_episode_valid_at AS last_summarized_episode_valid_at
 """
+
+
+def get_falkordb_node_vector_query(filter_queries: list[str], k: int) -> str:
+    """Indexed kNN over name_embedding with the same (2 - d) / 2 similarity mapping as the edge query."""
+    conditions = ['score > $min_score', *filter_queries]
+    return (
+        f"""
+    CALL db.idx.vector.queryNodes('Entity', 'name_embedding', {k}, vecf32($search_vector))
+    YIELD node AS n, score AS distance
+    WITH n, (2 - distance) / 2 AS score
+    WHERE """
+        + ' AND '.join(conditions)
+        + """
+    RETURN
+    """
+        + get_entity_node_return_query(GraphProvider.FALKORDB)
+        + """
+    ORDER BY score DESC
+    LIMIT $limit
+    """
+    )

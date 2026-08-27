@@ -203,7 +203,9 @@ class Neo4jDriver(GraphDriver):
                 return None
             raise
 
-    async def build_indices_and_constraints(self, delete_existing: bool = False):
+    async def build_indices_and_constraints(
+        self, delete_existing: bool = False, vector_dimension: int | None = None
+    ):
         if delete_existing:
             await self.delete_all_indexes()
 
