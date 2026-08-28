@@ -51,6 +51,7 @@ from graphiti_core.utils.maintenance.dedup_helpers import (
     _promote_resolved_node,
     _resolve_with_similarity,
 )
+from graphiti_core.utils.maintenance.enrichment_acl import EnrichmentAcl, acl_nodes
 from graphiti_core.utils.text_utils import (
     MAX_SUMMARY_CHARS,
     concatenate_episodes,
@@ -500,11 +501,14 @@ async def _collect_candidate_nodes(
     clients: GraphitiClients,
     extracted_nodes: list[EntityNode],
     existing_nodes_override: list[EntityNode] | None,
+    acl: EnrichmentAcl | None = None,
 ) -> list[list[EntityNode]]:
     """Search per extracted name and return ordered candidates for each extracted node."""
     search_results = await _semantic_candidate_search(clients, extracted_nodes)
 
-    return [_merge_candidate_nodes(result, existing_nodes_override) for result in search_results]
+    merged = [_merge_candidate_nodes(result, existing_nodes_override) for result in search_results]
+
+    return [await acl_nodes(acl, candidates) for candidates in merged]
 
 
 async def _semantic_candidate_search(
@@ -723,6 +727,7 @@ async def resolve_extracted_nodes(
     previous_episodes: list[EpisodicNode] | None = None,
     entity_types: dict[str, type[BaseModel]] | None = None,
     existing_nodes_override: list[EntityNode] | None = None,
+    acl: EnrichmentAcl | None = None,
 ) -> tuple[list[EntityNode], dict[str, str], list[tuple[EntityNode, EntityNode]]]:
     """Resolve nodes with semantic retrieval first, then deterministic and LLM dedup."""
     llm_client = clients.llm_client
@@ -730,6 +735,7 @@ async def resolve_extracted_nodes(
         clients,
         extracted_nodes,
         existing_nodes_override,
+        acl,
     )
 
     state = DedupResolutionState(

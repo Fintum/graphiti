@@ -96,6 +96,7 @@ from graphiti_core.utils.maintenance.edge_operations import (
     resolve_extracted_edges,
     search_related_edges,
 )
+from graphiti_core.utils.maintenance.enrichment_acl import EnrichmentAcl, acl_episodes
 from graphiti_core.utils.maintenance.graph_data_operations import (
     EPISODE_WINDOW_LEN,
     retrieve_episodes,
@@ -757,9 +758,10 @@ class Graphiti:
             edge_types: dict[str, type[BaseModel]] | None = None,
             edge_type_map: dict[tuple[str, str], list[str]] | None = None,
             saga: str | None = None,
-            get_previous_episodes: bool = False
+            get_previous_episodes: bool = False,
+            acl: EnrichmentAcl | None = None
         ) -> tuple[list[EntityNode], list[EntityEdge], list[EntityEdge], dict[str, str]]:
-        """Step 2. Resolve nodes and edges, and extract node attributes."""
+        """Step 2. Resolve nodes and edges, and extract node attributes, against candidates the acl allows."""
 
         # Create default edge type map
         edge_type_map_default = (
@@ -778,6 +780,7 @@ class Graphiti:
                 saga=saga,
                 # source=episode.source,
             )
+            previous_episodes = await acl_episodes(acl, previous_episodes)
 
         # Resolve extracted nodes against existing graph
         resolved_nodes, uuid_map, _ = await resolve_extracted_nodes(
@@ -786,6 +789,7 @@ class Graphiti:
             episode,
             previous_episodes,
             entity_types,
+            acl=acl,
         )
 
         # Check existing edges and compute embeddings
@@ -799,6 +803,7 @@ class Graphiti:
             resolved_nodes,
             edge_types or {},
             edge_type_map or edge_type_map_default,
+            acl=acl,
         )
 
         # Extract node attributes + summary + embeddings

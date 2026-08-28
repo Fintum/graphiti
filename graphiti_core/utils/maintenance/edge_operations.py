@@ -44,6 +44,7 @@ from graphiti_core.search.search_filters import SearchFilters
 from graphiti_core.utils.datetime_utils import ensure_utc, utc_now
 from graphiti_core.utils.maintenance.attribute_utils import apply_capped_attributes
 from graphiti_core.utils.maintenance.dedup_helpers import _normalize_string_exact
+from graphiti_core.utils.maintenance.enrichment_acl import EnrichmentAcl, acl_edges
 from graphiti_core.utils.text_utils import concatenate_episodes
 
 logger = logging.getLogger(__name__)
@@ -350,6 +351,7 @@ async def resolve_extracted_edges(
     edge_types: dict[str, type[BaseModel]],
     edge_type_map: dict[tuple[str, str], list[str]],
     existing_edges_override: list[EntityEdge] | None = None,
+    acl: EnrichmentAcl | None = None,
 ) -> tuple[list[EntityEdge], list[EntityEdge], list[EntityEdge]]:
     """Resolve extracted edges against existing graph context.
 
@@ -416,7 +418,9 @@ async def resolve_extracted_edges(
         ]
     )
 
-    related_edges_lists: list[list[EntityEdge]] = [result.edges for result in related_edges_results]
+    related_edges_lists: list[list[EntityEdge]] = [
+        await acl_edges(acl, result.edges) for result in related_edges_results
+    ]
 
     edge_invalidation_candidate_results: list[SearchResults] = await semaphore_gather(
         *[
@@ -441,7 +445,7 @@ async def resolve_extracted_edges(
         deduplicated = [
             edge for edge in invalidation_result.edges if edge.uuid not in related_uuids
         ]
-        edge_invalidation_candidates.append(deduplicated)
+        edge_invalidation_candidates.append(await acl_edges(acl, deduplicated))
 
     logger.debug(
         f'Related edges: {[e.uuid for edges_lst in related_edges_lists for e in edges_lst]}'
