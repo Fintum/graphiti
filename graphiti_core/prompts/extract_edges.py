@@ -23,6 +23,8 @@ from .prompt_helpers import to_prompt_json
 
 
 class Edge(BaseModel):
+    source_entity_uuid: str | None = Field(None, description='Exact uuid of the source entity in ENTITIES; never guess between homonyms')
+    target_entity_uuid: str | None = Field(None, description='Exact uuid of the target entity in ENTITIES; never guess between homonyms')
     source_entity_name: str = Field(
         ..., description='The name of the source entity from the ENTITIES list'
     )
@@ -145,6 +147,8 @@ You may use information from the PREVIOUS MESSAGES only to disambiguate referenc
 
 1. **Entity Name Validation**: `source_entity_name` and `target_entity_name` must use only the `name` values from the ENTITIES list provided above.
    - **CRITICAL**: Using names not in the list will cause the edge to be rejected
+   - Set `source_entity_uuid` and `target_entity_uuid` to the corresponding ENTITIES uuid.
+   - Homonyms are distinct identities. Only select a uuid when the message establishes which entity it refers to; otherwise omit the relationship.
 2. Each fact must involve two **distinct** entities — `source_entity_name` and `target_entity_name` NEVER refer to the same entity.
 3. Prefer facts that involve two distinct entities from the ENTITIES list. When a sentence describes a specific, concrete detail about a single entity (a brand name, a specific item, a physical description, a quantity, a location, a named activity), do NOT drop it. Instead, look for a second entity in the ENTITIES list that the detail relates to and form a proper triple (e.g., Entity -> OWNS -> item-entity, Entity -> LIVES_IN -> place-entity, Entity -> HAS_ATTRIBUTE -> detail-entity). Only skip the fact when no second entity in the ENTITIES list can anchor the detail.
    - BAD: "Alice feels happy" (vague single-entity state with no concrete detail — what is Alice happy about?)

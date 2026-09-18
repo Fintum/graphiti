@@ -25,6 +25,11 @@ from functools import lru_cache
 from hashlib import blake2b
 from typing import TYPE_CHECKING
 
+from graphiti_core.utils.maintenance.identity_constraints import (
+    identities_compatible,
+    require_same_identity,
+)
+
 if TYPE_CHECKING:
     from graphiti_core.nodes import EntityNode
 
@@ -222,18 +227,18 @@ def _resolve_with_similarity(
     indexes: DedupCandidateIndexes,
     state: DedupResolutionState,
 ) -> None:
-    """Attempt deterministic resolution using exact name hits and fuzzy MinHash comparisons.
-
-    Exact normalized-name matching runs first for *all* names regardless of
-    length or entropy.  The entropy gate only guards the fuzzy (MinHash/LSH)
-    path where short or low-entropy names produce unreliable shingle sets.
-    """
     for idx, node in enumerate(extracted_nodes):
+        exact = indexes.nodes_by_uuid.get(node.uuid)
+        if exact is not None:
+            require_same_identity(node, exact)
+            state.resolved_nodes[idx] = exact
+            state.uuid_map[node.uuid] = exact.uuid
+            continue
         normalized_exact = _normalize_string_exact(node.name)
         normalized_fuzzy = _normalize_name_for_fuzzy(node.name)
 
-        # --- exact-name matching (always attempted) ---
-        existing_matches = indexes.normalized_existing.get(normalized_exact, [])
+        existing_matches = [candidate for candidate in indexes.normalized_existing.get(normalized_exact, [])
+                            if identities_compatible(node, candidate)]
         if len(existing_matches) == 1:
             match = _promote_resolved_node(node, existing_matches[0])
             state.resolved_nodes[idx] = match
@@ -242,17 +247,13 @@ def _resolve_with_similarity(
                 state.duplicate_pairs.append((node, match))
             continue
         if len(existing_matches) > 1:
-            # Ambiguous: multiple candidates share the same normalized name.
-            # Escalate to LLM so it can pick the best match.
             state.unresolved_indices.append(idx)
             continue
 
-        # --- entropy gate (protects fuzzy matching only) ---
         if not _has_high_entropy(normalized_fuzzy):
             state.unresolved_indices.append(idx)
             continue
 
-        # --- fuzzy matching via MinHash/LSH ---
         shingles = _cached_shingles(normalized_fuzzy)
         signature = _minhash_signature(shingles)
         candidate_ids: set[str] = set()
@@ -262,6 +263,8 @@ def _resolve_with_similarity(
         best_candidate: EntityNode | None = None
         best_score = 0.0
         for candidate_id in candidate_ids:
+            if not identities_compatible(node, indexes.nodes_by_uuid[candidate_id]):
+                continue
             candidate_shingles = indexes.shingles_by_candidate.get(candidate_id, set())
             score = _jaccard_similarity(shingles, candidate_shingles)
             if score > best_score:

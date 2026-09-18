@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 from graphiti_core.driver.driver import GraphProvider
+from graphiti_core.utils.protected_persistence import preserving_update
 
 EPISODIC_EDGE_SAVE = """
     MATCH (episode:Episodic {uuid: $episode_uuid})
@@ -63,11 +64,11 @@ EPISODIC_EDGE_RETURN = """
 def get_entity_edge_save_query(provider: GraphProvider, has_aoss: bool = False) -> str:
     match provider:
         case GraphProvider.FALKORDB:
-            return """
-                MATCH (source:Entity {uuid: $edge_data.source_uuid})
-                MATCH (target:Entity {uuid: $edge_data.target_uuid})
-                MERGE (source)-[e:RELATES_TO {uuid: $edge_data.uuid}]->(target)
-                SET e = $edge_data
+            return f"""
+                MATCH (source:Entity {{uuid: $edge_data.source_uuid}})
+                MATCH (target:Entity {{uuid: $edge_data.target_uuid}})
+                MERGE (source)-[e:RELATES_TO {{uuid: $edge_data.uuid}}]->(target)
+                {preserving_update('e', '$edge_data')}
                 SET e.fact_embedding = vecf32($edge_data.fact_embedding)
                 RETURN e.uuid AS uuid
             """
@@ -125,12 +126,12 @@ def get_entity_edge_save_query(provider: GraphProvider, has_aoss: bool = False) 
 def get_entity_edge_save_bulk_query(provider: GraphProvider, has_aoss: bool = False) -> str:
     match provider:
         case GraphProvider.FALKORDB:
-            return """
+            return f"""
                 UNWIND $entity_edges AS edge
-                MATCH (source:Entity {uuid: edge.source_node_uuid})
-                MATCH (target:Entity {uuid: edge.target_node_uuid})
-                MERGE (source)-[r:RELATES_TO {uuid: edge.uuid}]->(target)
-                SET r = edge
+                MATCH (source:Entity {{uuid: edge.source_node_uuid}})
+                MATCH (target:Entity {{uuid: edge.target_node_uuid}})
+                MERGE (source)-[r:RELATES_TO {{uuid: edge.uuid}}]->(target)
+                {preserving_update('r', 'edge', 'edge')}
                 SET r.fact_embedding = vecf32(edge.fact_embedding)
                 WITH r, edge
                 RETURN edge.uuid AS uuid

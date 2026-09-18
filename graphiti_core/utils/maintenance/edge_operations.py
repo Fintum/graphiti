@@ -44,7 +44,13 @@ from graphiti_core.search.search_filters import SearchFilters
 from graphiti_core.utils.datetime_utils import ensure_utc, utc_now
 from graphiti_core.utils.maintenance.attribute_utils import apply_capped_attributes
 from graphiti_core.utils.maintenance.dedup_helpers import _normalize_string_exact
+from graphiti_core.utils.maintenance.edge_endpoints import EdgeEndpoints
 from graphiti_core.utils.maintenance.enrichment_acl import EnrichmentAcl, acl_edges
+from graphiti_core.utils.maintenance.identity_constraints import (
+    merge_provenance,
+    protected_attributes,
+    scopes_compatible,
+)
 from graphiti_core.utils.text_utils import concatenate_episodes
 
 logger = logging.getLogger(__name__)
@@ -116,7 +122,7 @@ def build_community_edges(
 
 
 async def extract_edges(
-    clients: GraphitiClients,
+    clients: GraphitiClients | LLMClient,
     episode: EpisodicNode | list[EpisodicNode],
     nodes: list[EntityNode],
     previous_episodes: list[EpisodicNode],
@@ -140,7 +146,7 @@ async def extract_edges(
     start = time()
 
     extract_edges_max_tokens = 16384
-    llm_client = clients.llm_client
+    llm_client = clients if isinstance(clients, LLMClient) else clients.llm_client
 
     # Build mapping from edge type name to list of valid signatures
     edge_type_signatures_map: dict[str, list[tuple[str, str]]] = {}
@@ -165,8 +171,7 @@ async def extract_edges(
         else []
     )
 
-    # Build name-to-node mapping for validation
-    name_to_node: dict[str, EntityNode] = {node.name: node for node in nodes}
+    endpoints = EdgeEndpoints(nodes)
 
     # Build episode attribution instructions for multi-episode extraction
     episode_attribution = ''
@@ -186,7 +191,7 @@ async def extract_edges(
     latest_episode = max(episodes, key=lambda ep: ep.valid_at)
     context = {
         'episode_content': concatenate_episodes(episodes),
-        'nodes': [{'name': node.name, 'entity_types': node.labels} for node in nodes],
+        'nodes': endpoints.context(),
         'previous_episodes': [
             {
                 'content': ep.content,
@@ -212,27 +217,10 @@ async def extract_edges(
     # Validate entity names
     edges_data: list[ExtractedEdge] = []
     for edge_data in all_edges_data:
-        source_name = edge_data.source_entity_name
-        target_name = edge_data.target_entity_name
-
-        # Validate LLM-returned names exist in the nodes list
-        if source_name not in name_to_node:
-            logger.warning(
-                'Source entity not found in nodes for edge relation: %s',
-                edge_data.relation_type,
-            )
+        source_node = endpoints.resolve(edge_data.source_entity_uuid, edge_data.source_entity_name)
+        target_node = endpoints.resolve(edge_data.target_entity_uuid, edge_data.target_entity_name)
+        if source_node is None or target_node is None:
             continue
-
-        if target_name not in name_to_node:
-            logger.warning(
-                'Target entity not found in nodes for edge relation: %s',
-                edge_data.relation_type,
-            )
-            continue
-
-        # Drop self-edges where source and target resolve to the same node
-        source_node = name_to_node[source_name]
-        target_node = name_to_node[target_name]
         if source_node.uuid == target_node.uuid:
             logger.info(
                 'Dropping self-edge for node %s (source and target resolve to same node)',
@@ -261,9 +249,8 @@ async def extract_edges(
         if not edge_data.fact.strip():
             continue
 
-        # Names already validated above
-        source_node = name_to_node.get(edge_data.source_entity_name)
-        target_node = name_to_node.get(edge_data.target_entity_name)
+        source_node = endpoints.resolve(edge_data.source_entity_uuid, edge_data.source_entity_name)
+        target_node = endpoints.resolve(edge_data.target_entity_uuid, edge_data.target_entity_name)
 
         if source_node is None or target_node is None:
             logger.warning('Could not find source or target node for extracted edge')
@@ -668,6 +655,15 @@ async def resolve_extracted_edge(
     tuple[EntityEdge, list[EntityEdge], list[EntityEdge]]
         The resolved edge, any duplicates, and edges to invalidate.
     """
+    related_edges = [edge for edge in related_edges
+                     if scopes_compatible(extracted_edge.attributes, edge.attributes)
+                     and edge.name == extracted_edge.name
+                     and edge.group_id == extracted_edge.group_id
+                     and edge.source_node_uuid == extracted_edge.source_node_uuid
+                     and edge.target_node_uuid == extracted_edge.target_node_uuid]
+    existing_edges = [edge for edge in existing_edges
+                      if scopes_compatible(extracted_edge.attributes, edge.attributes)
+                      and edge.group_id == extracted_edge.group_id]
     if len(related_edges) == 0 and len(existing_edges) == 0:
         # Still extract custom attributes and timestamps even when no dedup needed
         edge_model = edge_type_candidates.get(extracted_edge.name) if edge_type_candidates else None
@@ -708,6 +704,7 @@ async def resolve_extracted_edge(
             and _normalize_string_exact(edge.fact) == normalized_fact
         ):
             resolved = edge
+            resolved.attributes = merge_provenance(resolved.attributes, extracted_edge.attributes)
             if episode is not None and episode.uuid not in resolved.episodes:
                 resolved.episodes.append(episode.uuid)
             return resolved, [], []
@@ -767,7 +764,8 @@ async def resolve_extracted_edge(
         break
 
     if duplicate_fact_ids and episode is not None:
-        resolved_edge.episodes.append(episode.uuid)
+        resolved_edge.episodes = list(dict.fromkeys([*resolved_edge.episodes, episode.uuid]))
+        resolved_edge.attributes = merge_provenance(resolved_edge.attributes, extracted_edge.attributes)
 
     # Process contradicted facts (continuous indexing across both lists)
     contradicted_facts: list[int] = response_object.contradicted_facts
@@ -822,9 +820,7 @@ async def resolve_extracted_edge(
         )
         resolved_edge.attributes = merged
     else:
-        # No matching edge schema → no structured attributes apply; clear any stale
-        # attributes left from a prior schema. Intentionally not merged.
-        resolved_edge.attributes = {}
+        resolved_edge.attributes = protected_attributes(resolved_edge.attributes)
 
     # Extract timestamps for new edges (duplicated edges retain their existing timestamps)
     if resolved_edge.uuid == extracted_edge.uuid:

@@ -339,6 +339,10 @@ class EntityEdge(Edge):
             except NotImplementedError:
                 pass
 
+        from graphiti_core.utils.maintenance.protected_persistence import validate_entity_writes
+
+        await validate_entity_writes(driver, [], [self])
+
         edge_data: dict[str, Any] = {
             'source_uuid': self.source_node_uuid,
             'target_uuid': self.target_node_uuid,
@@ -974,6 +978,8 @@ def get_entity_edge_from_record(record: Any, provider: GraphProvider) -> EntityE
         attributes.pop('uuid', None)
         attributes.pop('source_node_uuid', None)
         attributes.pop('target_node_uuid', None)
+        attributes.pop('source_uuid', None)
+        attributes.pop('target_uuid', None)
         attributes.pop('fact', None)
         attributes.pop('fact_embedding', None)
         attributes.pop('name', None)

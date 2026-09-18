@@ -133,6 +133,9 @@ async def add_nodes_and_edges_bulk(
     entity_edges: list[EntityEdge],
     embedder: EmbedderClient,
 ):
+    from graphiti_core.utils.maintenance.protected_persistence import validate_entity_writes
+
+    await validate_entity_writes(driver, entity_nodes, entity_edges, tuple(episode.uuid for episode in episodic_nodes))
     session = driver.session()
     try:
         await session.execute_write(

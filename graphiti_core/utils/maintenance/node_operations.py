@@ -52,6 +52,12 @@ from graphiti_core.utils.maintenance.dedup_helpers import (
     _resolve_with_similarity,
 )
 from graphiti_core.utils.maintenance.enrichment_acl import EnrichmentAcl, acl_nodes
+from graphiti_core.utils.maintenance.identity_constraints import (
+    identities_compatible,
+    merge_provenance,
+    protected_attributes,
+    require_same_identity,
+)
 from graphiti_core.utils.text_utils import (
     MAX_SUMMARY_CHARS,
     concatenate_episodes,
@@ -71,7 +77,7 @@ NodeSummaryFilter = Callable[[EntityNode], Awaitable[bool]]
 
 
 async def extract_nodes(
-    clients: GraphitiClients,
+    clients: GraphitiClients | LLMClient,
     episode: EpisodicNode | list[EpisodicNode],
     previous_episodes: list[EpisodicNode],
     entity_types: dict[str, type[BaseModel]] | None = None,
@@ -98,7 +104,7 @@ async def extract_nodes(
     primary_episode = episodes[0]
 
     start = time()
-    llm_client = clients.llm_client
+    llm_client = clients if isinstance(clients, LLMClient) else clients.llm_client
 
     # Build entity types context
     entity_types_context = _build_entity_types_context(entity_types)
@@ -434,47 +440,23 @@ def _collapse_exact_duplicate_extracted_nodes(
     if len(extracted_nodes) < 2:
         return extracted_nodes
 
-    canonical_by_name: dict[str, EntityNode] = {}
-    ordered_names: list[str] = []
-
+    canonical_nodes: list[EntityNode] = []
     for node in extracted_nodes:
-        if 'Person' in node.labels:         # exact + fuzz matching
-            normalized_name = _normalize_string_exact(node.name)
-            existing_exact = canonical_by_name.get(normalized_name)
-            fuzz_name = compare_names_list(normalized_name, canonical_by_name.keys())
-            existing_fuzz = canonical_by_name.get(fuzz_name) if fuzz_name else None
-            existing = existing_exact or existing_fuzz
-        else:                               # Only exact
-            normalized_name = _normalize_string_exact(node.name)
-            existing = canonical_by_name.get(normalized_name)
-
+        existing = next((candidate for candidate in canonical_nodes
+                         if identities_compatible(node, candidate)
+                         and _normalize_string_exact(node.name) == _normalize_string_exact(candidate.name)), None)
         if existing is None:
-            canonical_by_name[normalized_name] = node
-            ordered_names.append(normalized_name)
+            canonical_nodes.append(node)
             continue
-
-        existing_specific_labels = {label for label in existing.labels if label != 'Entity'}
-        node_specific_labels = {label for label in node.labels if label != 'Entity'}
-        if len(node_specific_labels) > len(existing_specific_labels) or (
-            len(node_specific_labels) == len(existing_specific_labels)
-            and len(node.name.strip()) > len(existing.name.strip())
-        ):
-            old_canonical = existing
-            canonical_by_name[normalized_name] = node
-            # Merge episode indices: old canonical -> new canonical
-            if node_episode_index_map is not None:
-                old_indices = node_episode_index_map.pop(old_canonical.uuid, [])
-                new_indices = node_episode_index_map.get(node.uuid, [])
-                node_episode_index_map[node.uuid] = sorted(set(new_indices + old_indices))
-        elif node_episode_index_map is not None:
-            # Discard this node; merge its indices into the existing canonical
+        _promote_resolved_node(node, existing)
+        if node_episode_index_map is not None and node.uuid != existing.uuid:
             discarded_indices = node_episode_index_map.pop(node.uuid, [])
             canonical_indices = node_episode_index_map.get(existing.uuid, [])
             node_episode_index_map[existing.uuid] = sorted(
                 set(canonical_indices + discarded_indices)
             )
 
-    return [canonical_by_name[name] for name in ordered_names]
+    return canonical_nodes
 
 
 def _merge_candidate_nodes(
@@ -504,11 +486,26 @@ async def _collect_candidate_nodes(
     acl: EnrichmentAcl | None = None,
 ) -> list[list[EntityNode]]:
     """Search per extracted name and return ordered candidates for each extracted node."""
-    search_results = await _semantic_candidate_search(clients, extracted_nodes)
+    from graphiti_core.utils.maintenance.protected_persistence import validate_entity_writes
 
-    merged = [_merge_candidate_nodes(result, existing_nodes_override) for result in search_results]
-
-    return [await acl_nodes(acl, candidates) for candidates in merged]
+    await validate_entity_writes(clients.driver, extracted_nodes, [])
+    stored = await EntityNode.get_by_uuids(clients.driver, [node.uuid for node in extracted_nodes]) if extracted_nodes else []
+    by_uuid = {node.uuid: node for node in stored}
+    visible = {node.uuid: node for node in await acl_nodes(acl, stored)}
+    unresolved = [node for node in extracted_nodes if node.uuid not in by_uuid]
+    search_results = iter(await _semantic_candidate_search(clients, unresolved))
+    result = []
+    for node in extracted_nodes:
+        exact = by_uuid.get(node.uuid)
+        if exact is not None:
+            require_same_identity(node, exact)
+            candidate = visible.get(node.uuid, node.model_copy(deep=True))
+            candidate.attributes = merge_provenance(candidate.attributes, node.attributes)
+            result.append([candidate])
+        else:
+            candidates = await acl_nodes(acl, _merge_candidate_nodes(next(search_results), existing_nodes_override))
+            result.append([candidate for candidate in candidates if identities_compatible(node, candidate)])
+    return result
 
 
 async def _semantic_candidate_search(
@@ -703,9 +700,9 @@ async def _resolve_with_llm(
         if duplicate_candidate_id < 0:
             resolved_node = extracted_node
         elif duplicate_candidate_id in candidates_by_id:
-            resolved_node = _promote_resolved_node(
-                extracted_node, candidates_by_id[duplicate_candidate_id]
-            )
+            candidate = candidates_by_id[duplicate_candidate_id]
+            resolved_node = (_promote_resolved_node(extracted_node, candidate)
+                             if identities_compatible(extracted_node, candidate) else extracted_node)
         else:
             logger.warning(
                 'Invalid duplicate_candidate_id %d for extracted node %s; treating as no duplicate.',
@@ -886,7 +883,7 @@ async def _extract_entity_attributes(
     entity_type: type[BaseModel] | None,
 ) -> dict[str, Any]:
     if entity_type is None or len(entity_type.model_fields) == 0:
-        return {}
+        return protected_attributes(node.attributes)
 
     attributes_context = _build_episode_context(
         # should not include summary
@@ -1091,10 +1088,9 @@ async def _process_summary_flight(
     summaries_response = SummarizedEntities(**llm_response)
     for summarized_entity in summaries_response.summaries:
         matching_nodes = name_to_nodes.get(summarized_entity.name.lower(), [])
-        if matching_nodes:
+        if len(matching_nodes) == 1:
             truncated_summary = truncate_at_sentence(summarized_entity.summary, MAX_SUMMARY_CHARS)
-            for node in matching_nodes:
-                node.summary = truncated_summary
+            matching_nodes[0].summary = truncated_summary
         else:
             logger.warning(
                 'LLM returned summary for unknown entity (first 30 chars): %.30s',

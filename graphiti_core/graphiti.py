@@ -695,7 +695,8 @@ class Graphiti:
             edge_type_map: dict[tuple[str, str], list[str]] | None = None,
             custom_extraction_instructions: str | None = None,
             saga: str | None = None,
-            get_previous_episodes: bool = False
+            get_previous_episodes: bool = False,
+            known_nodes: list[EntityNode] | None = None,
         ) -> tuple[list[EntityNode], dict[str, list[int]], list[EntityEdge]]:
         """Step 1. Validate entity types and extract nodes and edges from episode."""
 
@@ -729,9 +730,11 @@ class Graphiti:
             excluded_entity_types,
             custom_extraction_instructions,
         )
-        if document_node is not None:
-            extracted_nodes.insert(0, document_node)
-            node_episode_index_map[document_node.uuid] = [0]
+        from graphiti_core.utils.maintenance.known_nodes import inject_known_nodes
+
+        extracted_nodes = inject_known_nodes(extracted_nodes, known_nodes or [], document_node)
+        for node in extracted_nodes:
+            node_episode_index_map.setdefault(node.uuid, [0])
 
         # Extract edges from episode
         extracted_edges = await extract_edges(
@@ -1882,6 +1885,9 @@ class Graphiti:
     async def add_triplet(
         self, source_node: EntityNode, edge: EntityEdge, target_node: EntityNode
     ) -> AddTripletResults:
+        from graphiti_core.utils.maintenance.protected_persistence import validate_entity_writes
+
+        await validate_entity_writes(self.driver, [source_node, target_node], [edge])
         if source_node.name_embedding is None:
             await source_node.generate_name_embedding(self.embedder)
         if target_node.name_embedding is None:

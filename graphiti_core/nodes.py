@@ -338,6 +338,10 @@ class EpisodicNode(Node):
             except NotImplementedError:
                 pass
 
+        from graphiti_core.utils.maintenance.protected_persistence import validate_entity_writes
+
+        await validate_entity_writes(driver, [], [], (self.uuid,))
+
         episode_args = {
             'uuid': self.uuid,
             'name': self.name,
@@ -549,6 +553,10 @@ class EntityNode(Node):
                 return await driver.graph_operations_interface.node_save(self, driver)
             except NotImplementedError:
                 pass
+
+        from graphiti_core.utils.maintenance.protected_persistence import validate_entity_writes
+
+        await validate_entity_writes(driver, [self], [])
 
         entity_data: dict[str, Any] = {
             'uuid': self.uuid,

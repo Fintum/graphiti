@@ -22,6 +22,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel
 
+from graphiti_core.utils.maintenance.identity_constraints import inferred_attributes, preserve_authority
+
 logger = logging.getLogger(__name__)
 
 # Default cap for free-form string attribute values. Calibrated to comfortably fit
@@ -235,7 +237,7 @@ def apply_capped_attributes(
     that want to log or react to it independently.
     """
     kept, dropped = cap_string_attributes(
-        response,
+        {key: value for key, value in inferred_attributes(response).items() if key in model.model_fields},
         model,
         default_max_length=default_max_length,
         prompt_name=prompt_name,
@@ -251,4 +253,4 @@ def apply_capped_attributes(
                 merged[field] = prior_attributes[field]
     else:  # pragma: no cover — Literal protects this at type-check time.
         raise ValueError(f'merge_mode must be "overlay" or "replace", got {merge_mode!r}')
-    return merged, dropped
+    return preserve_authority(prior_attributes, merged), dropped
