@@ -18,6 +18,7 @@ import logging
 from collections.abc import Sequence
 from datetime import datetime
 from time import time
+from typing import Any
 
 from pydantic import BaseModel
 from typing_extensions import LiteralString
@@ -47,8 +48,10 @@ from graphiti_core.utils.maintenance.attribute_utils import apply_capped_attribu
 from graphiti_core.utils.maintenance.dedup_helpers import _normalize_string_exact
 from graphiti_core.utils.maintenance.edge_endpoints import EdgeEndpoints
 from graphiti_core.utils.maintenance.enrichment_acl import EnrichmentAcl, acl_edges
+from graphiti_core.utils.maintenance.hydration_hooks import EdgeAttributeQuestion, EdgeAttributes
 from graphiti_core.utils.maintenance.identity_constraints import (
     merge_provenance,
+    prompt_attributes,
     protected_attributes,
     scopes_compatible,
 )
@@ -347,12 +350,14 @@ async def resolve_extracted_edges(
     existing_edges_override: list[EntityEdge] | None = None,
     acl: EnrichmentAcl | None = None,
     decisions: ResolutionDecisions | None = None,
+    edge_attributes: EdgeAttributes | None = None,
 ) -> tuple[list[EntityEdge], list[EntityEdge], list[EntityEdge]]:
     """Resolve extracted edges against existing graph context.
 
     Every edge the literal fast path does not settle and that has candidates is judged in a single
     ``decisions.resolve_edges`` call, and the new edges are dated in a single ``date_edges`` call;
-    ``decisions=None`` means today's LLM prompts.
+    ``decisions=None`` means today's LLM prompts. ``edge_attributes`` answers the typed edges in a
+    single call instead of one attributes prompt each.
 
     Returns
     -------
@@ -523,7 +528,14 @@ async def resolve_extracted_edges(
         for index, verdict in zip(asked, verdicts, strict=True):
             answers[index] = verdict
     results = await _apply_edge_answers(
-        llm_client, decisions, questions, answers, episode, edge_types_lst
+        llm_client,
+        decisions,
+        questions,
+        answers,
+        episode,
+        edge_types_lst,
+        edge_attributes,
+        uuid_entity_map,
     )
 
     resolved_edges: list[EntityEdge] = []
@@ -820,19 +832,34 @@ async def _apply_edge_answers(
     answers: list[EntityEdge | EdgeVerdict | None],
     episode: EpisodicNode,
     edge_types_lst: Sequence[dict[str, type[BaseModel]] | None],
+    edge_attributes: EdgeAttributes | None = None,
+    endpoints: dict[str, EntityNode] | None = None,
 ) -> list[tuple[EntityEdge, list[EntityEdge]]]:
     """Apply every answer, date the edges that stay new in one call, then settle their validity.
 
     Literal duplicates are neither dated nor revisited, and only a verdict can invalidate edges.
+    With ``edge_attributes`` the typed edges get their attributes from one call to it, which sees
+    their endpoints in ``endpoints``, instead of one prompt each.
     """
     applied = await semaphore_gather(
         *[
-            _apply_edge_answer(llm_client, question, answer, episode, edge_type_candidates)
+            _apply_edge_answer(
+                llm_client,
+                question,
+                answer,
+                episode,
+                edge_type_candidates,
+                extract_attributes=edge_attributes is None,
+            )
             for question, answer, edge_type_candidates in zip(
                 questions, answers, edge_types_lst, strict=True
             )
         ]
     )
+    if edge_attributes is not None:
+        await _hydrate_edge_attributes(
+            edge_attributes, episode, answers, applied, edge_types_lst, endpoints or {}
+        )
     # Extract timestamps for new edges (duplicated edges retain their existing timestamps)
     undated = [
         resolved_edge
@@ -858,18 +885,23 @@ async def _apply_edge_answer(
     answer: EntityEdge | EdgeVerdict | None,
     episode: EpisodicNode,
     edge_type_candidates: dict[str, type[BaseModel]] | None,
+    extract_attributes: bool = True,
 ) -> tuple[EntityEdge, list[EntityEdge]]:
     """Resolve one edge from its answer and return it with the contradicted edges to weigh.
 
     A verdict only counts for the edges its question offered: a duplicate outside the duplicates,
-    or a contradicted edge the question never offered, is ignored.
+    or a contradicted edge the question never offered, is ignored. Without ``extract_attributes``
+    the typed edges are left for the attributes hook.
     """
     extracted_edge = question.extracted
     if isinstance(answer, EntityEdge):
         return answer, []
     if answer is None:
         # Still extract custom attributes and timestamps even when no dedup needed
-        await _extract_edge_attributes(llm_client, extracted_edge, episode, edge_type_candidates)
+        if extract_attributes:
+            await _extract_edge_attributes(
+                llm_client, extracted_edge, episode, edge_type_candidates
+            )
         return extracted_edge, []
 
     resolved_edge = extracted_edge
@@ -885,11 +917,47 @@ async def _apply_edge_answer(
 
     # Only extract structured attributes if the edge's relation_type matches an allowed custom type
     # AND the edge model exists for this node pair signature
-    if not await _extract_edge_attributes(llm_client, resolved_edge, episode, edge_type_candidates):
+    if _edge_model(resolved_edge, edge_type_candidates) is None:
         resolved_edge.attributes = protected_attributes(resolved_edge.attributes)
+    elif extract_attributes:
+        await _extract_edge_attributes(llm_client, resolved_edge, episode, edge_type_candidates)
 
     offered = {edge.uuid for edge in (*question.duplicates, *question.invalidations)}
     return resolved_edge, [edge for edge in answer.contradicted if edge.uuid in offered]
+
+
+async def _hydrate_edge_attributes(
+    edge_attributes: EdgeAttributes,
+    episode: EpisodicNode,
+    answers: list[EntityEdge | EdgeVerdict | None],
+    applied: list[tuple[EntityEdge, list[EntityEdge]]],
+    edge_types_lst: Sequence[dict[str, type[BaseModel]] | None],
+    endpoints: dict[str, EntityNode],
+) -> None:
+    """Ask the hook once about every typed edge but the literal duplicates and merge its answers.
+
+    Each answer replaces the inferred attributes of its edge as the prompt's answer does.
+    """
+    questions: list[EdgeAttributeQuestion] = []
+    for answer, (edge, _), edge_type_candidates in zip(
+        answers, applied, edge_types_lst, strict=True
+    ):
+        edge_model = _edge_model(edge, edge_type_candidates)
+        if edge_model is not None and not isinstance(answer, EntityEdge):
+            questions.append(
+                EdgeAttributeQuestion(
+                    edge,
+                    edge_model,
+                    endpoints.get(edge.source_node_uuid),
+                    endpoints.get(edge.target_node_uuid),
+                )
+            )
+    if not questions:
+        return
+    for question, response in zip(
+        questions, await edge_attributes(episode, questions), strict=True
+    ):
+        _merge_edge_attributes(question.edge, question.edge_type, response)
 
 
 async def _extract_edge_attributes(
@@ -899,24 +967,50 @@ async def _extract_edge_attributes(
     edge_type_candidates: dict[str, type[BaseModel]] | None,
 ) -> bool:
     """Extract the custom attributes the edge's type declares; False when it declares none."""
-    edge_model = edge_type_candidates.get(edge.name) if edge_type_candidates else None
-    if edge_model is None or len(edge_model.model_fields) == 0:
+    edge_model = _edge_model(edge, edge_type_candidates)
+    if edge_model is None:
         return False
 
+    response = await _ask_edge_attributes(llm_client, edge, episode, edge_model)
+    _merge_edge_attributes(edge, edge_model, response)
+    return True
+
+
+def _edge_model(
+    edge: EntityEdge, edge_type_candidates: dict[str, type[BaseModel]] | None
+) -> type[BaseModel] | None:
+    """The custom type of the edge's relation, when it declares attributes."""
+    edge_model = edge_type_candidates.get(edge.name) if edge_type_candidates else None
+    return edge_model if edge_model is not None and edge_model.model_fields else None
+
+
+async def _ask_edge_attributes(
+    llm_client: LLMClient,
+    edge: EntityEdge,
+    episode: EpisodicNode | None,
+    edge_model: type[BaseModel],
+) -> dict[str, Any]:
+    """Ask today's attributes prompt about one typed edge, without its protected attributes."""
     edge_attributes_context = {
         'fact': edge.fact,
         'reference_time': episode.valid_at if episode is not None else None,
-        'existing_attributes': edge.attributes,
+        'existing_attributes': prompt_attributes(edge.attributes),
     }
-    edge_attributes_response = await llm_client.generate_response(
+    return await llm_client.generate_response(
         prompt_library.extract_edges.extract_attributes(edge_attributes_context),
         response_model=edge_model,
         model_size=ModelSize.small,
         prompt_name='extract_edges.extract_attributes',
         attribute_extraction=True,
     )
+
+
+def _merge_edge_attributes(
+    edge: EntityEdge, edge_model: type[BaseModel], response: dict[str, Any]
+) -> None:
+    """Let the capped answer replace the edge's inferred attributes, keeping the protected ones."""
     edge.attributes, _ = apply_capped_attributes(
-        edge_attributes_response,
+        response,
         edge_model,
         edge.attributes,
         merge_mode='replace',
@@ -924,7 +1018,6 @@ async def _extract_edge_attributes(
         entity_uuid=edge.uuid,
         group_id=edge.group_id,
     )
-    return True
 
 
 def _settle_edge_validity(

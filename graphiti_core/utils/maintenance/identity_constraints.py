@@ -25,6 +25,7 @@ from graphiti_core.utils.identity_constraints import (
     inferred_attributes as inferred_attributes,
     merge_provenance as merge_provenance,
     preserve_authority as preserve_authority,
+    prompt_attributes as prompt_attributes,
     protected_attributes as protected_attributes,
     require_same_identity as require_same_identity,
     scopes_compatible as scopes_compatible,

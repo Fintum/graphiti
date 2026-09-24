@@ -51,6 +51,10 @@ def inferred_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def prompt_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in attributes.items() if key not in PROTECTED_ATTRIBUTES}
+
+
 def preserve_authority(prior: dict[str, Any], inferred: dict[str, Any]) -> dict[str, Any]:
     return {**inferred_attributes(inferred), **protected_attributes(prior)}
 

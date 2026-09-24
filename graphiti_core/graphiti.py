@@ -101,6 +101,12 @@ from graphiti_core.utils.maintenance.graph_data_operations import (
     EPISODE_WINDOW_LEN,
     retrieve_episodes,
 )
+from graphiti_core.utils.maintenance.hydration_hooks import (
+    EdgeAttributes,
+    NodeAttributes,
+    SummaryPolicy,
+    _summary_filter,
+)
 from graphiti_core.utils.maintenance.node_operations import (
     extract_attributes_from_nodes,
     extract_nodes,
@@ -765,8 +771,19 @@ class Graphiti:
             get_previous_episodes: bool = False,
             acl: EnrichmentAcl | None = None,
             decisions: ResolutionDecisions | None = None,
+            previous_episodes: list[EpisodicNode] | None = None,
+            node_attributes: NodeAttributes | None = None,
+            edge_attributes: EdgeAttributes | None = None,
+            should_summarize_node: SummaryPolicy | None = None,
         ) -> tuple[list[EntityNode], list[EntityEdge], list[EntityEdge], dict[str, str]]:
-        """Step 2. Resolve nodes and edges, and extract node attributes, against candidates the acl allows."""
+        """Step 2. Resolve nodes and edges, and extract node attributes, against candidates the acl allows.
+
+        Explicit previous_episodes are used as given, with neither retrieval nor the acl,
+        and exclude get_previous_episodes. The hooks replace the attribute prompts and choose
+        which resolved nodes get their facts appended and a summary; None keeps today's behaviour.
+        """
+        if previous_episodes is not None and get_previous_episodes:
+            raise ValueError('pass previous_episodes or get_previous_episodes, not both')
 
         # Create default edge type map
         edge_type_map_default = (
@@ -775,8 +792,8 @@ class Graphiti:
             else {('Entity', 'Entity'): []}
         )
 
-        # Retrieve previous episodes for context
-        previous_episodes: list[EpisodicNode] = []
+        # Retrieve previous episodes for context, unless the caller gave them
+        previous_episodes = previous_episodes or []
         if get_previous_episodes:
             previous_episodes = await self.retrieve_episodes(
                 episode.valid_at or utc_now(),
@@ -811,6 +828,7 @@ class Graphiti:
             edge_type_map or edge_type_map_default,
             acl=acl,
             decisions=decisions,
+            edge_attributes=edge_attributes,
         )
 
         # Extract node attributes + summary + embeddings
@@ -821,7 +839,11 @@ class Graphiti:
             episode,
             previous_episodes,
             entity_types,
+            should_summarize_node=await _summary_filter(
+                should_summarize_node, resolved_nodes, new_edges, invalidated_edges
+            ),
             edges=new_edges,
+            node_attributes=node_attributes,
         )
 
         return hydrated_nodes, resolved_edges, invalidated_edges, uuid_map

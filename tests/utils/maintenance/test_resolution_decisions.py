@@ -497,7 +497,7 @@ def todays_edge_prompts() -> Counter[Call]:
                     {
                         'fact': fact,
                         'reference_time': NOW,
-                        'existing_attributes': {'provenance': ['episode']},
+                        'existing_attributes': {},
                     },
                     Leads,
                     attribute_extraction=True,

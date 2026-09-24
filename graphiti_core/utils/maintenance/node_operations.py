@@ -52,9 +52,11 @@ from graphiti_core.utils.maintenance.dedup_helpers import (
     _resolve_with_similarity,
 )
 from graphiti_core.utils.maintenance.enrichment_acl import EnrichmentAcl, acl_nodes
+from graphiti_core.utils.maintenance.hydration_hooks import AttributeQuestion, NodeAttributes
 from graphiti_core.utils.maintenance.identity_constraints import (
     identities_compatible,
     merge_provenance,
+    prompt_attributes,
     protected_attributes,
     require_same_identity,
 )
@@ -616,7 +618,7 @@ async def _resolve_with_llm(
 
     existing_nodes_context = [
         {
-            **candidate.attributes,
+            **prompt_attributes(candidate.attributes),
             'candidate_id': i,
             'name': candidate.name,
             'entity_types': candidate.labels,
@@ -860,6 +862,7 @@ async def extract_attributes_from_nodes(
     edges: list[EntityEdge] | None = None,
     skip_fact_appending: bool = False,
     include_type_descriptions: bool = False,
+    node_attributes: NodeAttributes | None = None,
 ) -> list[EntityNode]:
     llm_client = clients.llm_client
     embedder = clients.embedder
@@ -867,23 +870,30 @@ async def extract_attributes_from_nodes(
     # Pre-build edges lookup for O(E + N) instead of O(N * E)
     edges_by_node = _build_edges_by_node(edges)
 
-    # Extract attributes in parallel (per-entity calls)
-    attribute_results: list[dict[str, Any]] = await semaphore_gather(
-        *[
-            _extract_entity_attributes(
-                llm_client,
-                node,
-                episode,
-                previous_episodes,
-                (
-                    entity_types.get(next((item for item in node.labels if item != 'Entity'), ''))
-                    if entity_types is not None
-                    else None
-                ),
-            )
-            for node in nodes
-        ]
-    )
+    # Extract attributes in parallel (per-entity calls), or with one call to the hook
+    if node_attributes is None:
+        attribute_results: list[dict[str, Any]] = await semaphore_gather(
+            *[
+                _extract_entity_attributes(
+                    llm_client,
+                    node,
+                    episode,
+                    previous_episodes,
+                    (
+                        entity_types.get(
+                            next((item for item in node.labels if item != 'Entity'), '')
+                        )
+                        if entity_types is not None
+                        else None
+                    ),
+                )
+                for node in nodes
+            ]
+        )
+    else:
+        attribute_results = await _hydrate_entity_attributes(
+            node_attributes, nodes, episode, previous_episodes, entity_types
+        )
 
     # _extract_entity_attributes returns the already-merged attribute dict
     # (overlay of prior + cap-kept fields), so direct assignment is the merge.
@@ -917,18 +927,73 @@ async def _extract_entity_attributes(
     if entity_type is None or len(entity_type.model_fields) == 0:
         return protected_attributes(node.attributes)
 
+    llm_response = await _ask_entity_attributes(
+        llm_client, node, episode, previous_episodes, entity_type
+    )
+    return _merge_entity_attributes(node, entity_type, llm_response)
+
+
+async def _hydrate_entity_attributes(
+    node_attributes: NodeAttributes,
+    nodes: list[EntityNode],
+    episode: EpisodicNode | list[EpisodicNode] | None,
+    previous_episodes: list[EpisodicNode] | None,
+    entity_types: dict[str, type[BaseModel]] | None,
+) -> list[dict[str, Any]]:
+    """Answer every node whose type declares attributes with one call to the hook.
+
+    The answers are merged as the prompt's are; any other node keeps only its protected attributes.
+    """
+    questions: list[tuple[int, AttributeQuestion]] = []
+    for index, node in enumerate(nodes):
+        entity_type = _attribute_type(node, entity_types)
+        if entity_type is not None:
+            questions.append((index, AttributeQuestion(node, entity_type)))
+    answers = (
+        await node_attributes(
+            episode, previous_episodes or [], [question for _, question in questions]
+        )
+        if questions
+        else []
+    )
+    attributes = [protected_attributes(node.attributes) for node in nodes]
+    for (index, question), answer in zip(questions, answers, strict=True):
+        attributes[index] = _merge_entity_attributes(question.node, question.entity_type, answer)
+    return attributes
+
+
+def _attribute_type(
+    node: EntityNode, entity_types: dict[str, type[BaseModel]] | None
+) -> type[BaseModel] | None:
+    """The entity type of the node, when it declares attributes."""
+    entity_type = (
+        entity_types.get(next((item for item in node.labels if item != 'Entity'), ''))
+        if entity_types is not None
+        else None
+    )
+    return entity_type if entity_type is not None and entity_type.model_fields else None
+
+
+async def _ask_entity_attributes(
+    llm_client: LLMClient,
+    node: EntityNode,
+    episode: EpisodicNode | list[EpisodicNode] | None,
+    previous_episodes: list[EpisodicNode] | None,
+    entity_type: type[BaseModel],
+) -> dict[str, Any]:
+    """Ask today's attributes prompt about one typed node, without its protected attributes."""
     attributes_context = _build_episode_context(
         # should not include summary
         node_data={
             'name': node.name,
             'entity_types': node.labels,
-            'attributes': node.attributes,
+            'attributes': prompt_attributes(node.attributes),
         },
         episode=episode,
         previous_episodes=previous_episodes,
     )
 
-    llm_response = await llm_client.generate_response(
+    return await llm_client.generate_response(
         prompt_library.extract_nodes.extract_attributes(attributes_context),
         response_model=entity_type,
         model_size=ModelSize.small,
@@ -937,10 +1002,15 @@ async def _extract_entity_attributes(
         attribute_extraction=True,
     )
 
+
+def _merge_entity_attributes(
+    node: EntityNode, entity_type: type[BaseModel], response: dict[str, Any]
+) -> dict[str, Any]:
+    """Overlay the capped answer on the node, keep its protected attributes and check the shape."""
     # Overlay merge: cap-dropped or LLM-omitted fields keep prior values.
     # See attribute_utils for the merge_mode contract; the edge path uses 'replace'.
     merged, _ = apply_capped_attributes(
-        llm_response,
+        response,
         entity_type,
         node.attributes,
         merge_mode='overlay',
@@ -1061,7 +1131,7 @@ async def _process_summary_flight(
             'name': node.name,
             'summary': node.summary,
             'entity_types': node.labels,
-            'attributes': node.attributes,
+            'attributes': prompt_attributes(node.attributes),
         }
         for node in nodes
     ]
