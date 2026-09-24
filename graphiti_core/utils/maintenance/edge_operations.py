@@ -47,6 +47,7 @@ from graphiti_core.utils.datetime_utils import ensure_utc, utc_now
 from graphiti_core.utils.maintenance.attribute_utils import apply_capped_attributes
 from graphiti_core.utils.maintenance.dedup_helpers import _normalize_string_exact
 from graphiti_core.utils.maintenance.edge_endpoints import EdgeEndpoints
+from graphiti_core.utils.maintenance.embedding_reuse import fact_search_vector
 from graphiti_core.utils.maintenance.enrichment_acl import EnrichmentAcl, acl_edges
 from graphiti_core.utils.maintenance.hydration_hooks import EdgeAttributeQuestion, EdgeAttributes
 from graphiti_core.utils.maintenance.identity_constraints import (
@@ -324,8 +325,12 @@ async def search_related_edges(
     clients: GraphitiClients,
     extracted_edge: EntityEdge,
     candidate_edges: list[EntityEdge],
+    query_vector: list[float] | None = None,
 ) -> SearchResults:
-    """Search for edges related to an extracted edge, skipping the query when there are no candidates."""
+    """Search for edges related to an extracted edge, skipping the query when there are no candidates.
+
+    A given ``query_vector`` spares the search embedding the fact again.
+    """
     if not candidate_edges:
         # An empty edge_uuids filter is unsatisfiable, so the search would always
         # return nothing; skip the round trip to the graph database entirely.
@@ -337,6 +342,7 @@ async def search_related_edges(
         group_ids=[extracted_edge.group_id],
         config=EDGE_HYBRID_SEARCH_RRF,
         search_filter=SearchFilters(edge_uuids=[edge.uuid for edge in candidate_edges]),
+        query_vector=query_vector,
     )
 
 
@@ -358,6 +364,10 @@ async def resolve_extracted_edges(
     ``decisions.resolve_edges`` call, and the new edges are dated in a single ``date_edges`` call;
     ``decisions=None`` means today's LLM prompts. ``edge_attributes`` answers the typed edges in a
     single call instead of one attributes prompt each.
+
+    The extracted edges are embedded in one batch whose vectors also serve their searches. The
+    stored edges an episode resolves to or invalidates come back with no vector, for the caller to
+    load them with ``embedding_reuse.reuse_fact_embeddings``.
 
     Returns
     -------
@@ -417,7 +427,9 @@ async def resolve_extracted_edges(
 
     related_edges_results: list[SearchResults] = await semaphore_gather(
         *[
-            search_related_edges(clients, extracted_edge, valid_edges)
+            search_related_edges(
+                clients, extracted_edge, valid_edges, fact_search_vector(extracted_edge)
+            )
             for extracted_edge, valid_edges in zip(extracted_edges, valid_edges_list, strict=True)
         ]
     )
@@ -434,6 +446,7 @@ async def resolve_extracted_edges(
                 group_ids=[extracted_edge.group_id],
                 config=EDGE_HYBRID_SEARCH_RRF,
                 search_filter=SearchFilters(),
+                query_vector=fact_search_vector(extracted_edge),
             )
             for extracted_edge in extracted_edges
         ]
@@ -554,11 +567,6 @@ async def resolve_extracted_edges(
 
     logger.debug(f'Resolved edges: {[e.uuid for e in resolved_edges]}')
     logger.debug(f'New edges (non-duplicates): {[e.uuid for e in new_edges]}')
-
-    await semaphore_gather(
-        create_entity_edge_embeddings(embedder, resolved_edges),
-        create_entity_edge_embeddings(embedder, invalidated_edges),
-    )
 
     return resolved_edges, invalidated_edges, new_edges
 

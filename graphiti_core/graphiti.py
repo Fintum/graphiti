@@ -96,6 +96,10 @@ from graphiti_core.utils.maintenance.edge_operations import (
     resolve_extracted_edges,
     search_related_edges,
 )
+from graphiti_core.utils.maintenance.embedding_reuse import (
+    load_name_embeddings,
+    reuse_fact_embeddings,
+)
 from graphiti_core.utils.maintenance.enrichment_acl import EnrichmentAcl, acl_episodes
 from graphiti_core.utils.maintenance.graph_data_operations import (
     EPISODE_WINDOW_LEN,
@@ -687,6 +691,7 @@ class Graphiti:
             edge_types or {},
             edge_type_map,
         )
+        await reuse_fact_embeddings(self.clients, [*resolved_edges, *invalidated_edges])
 
         return resolved_edges, invalidated_edges, new_edges
 
@@ -781,6 +786,8 @@ class Graphiti:
         Explicit previous_episodes are used as given, with neither retrieval nor the acl,
         and exclude get_previous_episodes. The hooks replace the attribute prompts and choose
         which resolved nodes get their facts appended and a summary; None keeps today's behaviour.
+        The stored nodes and edges keep their stored vectors, so an episode embeds the names it
+        does not find by uuid and its facts, each in one batch.
         """
         if previous_episodes is not None and get_previous_episodes:
             raise ValueError('pass previous_episodes or get_previous_episodes, not both')
@@ -830,6 +837,8 @@ class Graphiti:
             decisions=decisions,
             edge_attributes=edge_attributes,
         )
+        await reuse_fact_embeddings(self.clients, [*resolved_edges, *invalidated_edges])
+        await load_name_embeddings(self.clients.driver, resolved_nodes)
 
         # Extract node attributes + summary + embeddings
         # using only new edges to avoid duplication)
@@ -1183,6 +1192,7 @@ class Graphiti:
             invalidated_edges.extend(result[1])
             # result[2] is new_edges - not used in bulk flow since attributes
             # are extracted before edge resolution
+        await reuse_fact_embeddings(self.clients, [*resolved_edges, *invalidated_edges])
 
         return final_hydrated_nodes, resolved_edges, invalidated_edges, uuid_map
 

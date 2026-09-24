@@ -26,12 +26,7 @@ from graphiti_core.graphiti_types import GraphitiClients
 from graphiti_core.helpers import semaphore_gather
 from graphiti_core.llm_client import LLMClient
 from graphiti_core.llm_client.config import ModelSize
-from graphiti_core.nodes import (
-    EntityNode,
-    EpisodeType,
-    EpisodicNode,
-    create_entity_node_embeddings,
-)
+from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode
 from graphiti_core.prompts import prompt_library
 from graphiti_core.prompts.dedupe_nodes import NodeDuplicate, NodeResolutions
 from graphiti_core.prompts.extract_nodes import (
@@ -50,6 +45,11 @@ from graphiti_core.utils.maintenance.dedup_helpers import (
     _normalize_string_exact,
     _promote_resolved_node,
     _resolve_with_similarity,
+)
+from graphiti_core.utils.maintenance.embedding_reuse import (
+    embed_missing_names,
+    keep_name_vectors,
+    search_text,
 )
 from graphiti_core.utils.maintenance.enrichment_acl import EnrichmentAcl, acl_nodes
 from graphiti_core.utils.maintenance.hydration_hooks import AttributeQuestion, NodeAttributes
@@ -519,11 +519,14 @@ async def _semantic_candidate_search(
     clients: GraphitiClients,
     extracted_nodes: list[EntityNode],
 ) -> list[list[EntityNode]]:
-    """Run direct cosine similarity search per extracted node without reranking."""
+    """Run direct cosine similarity search per extracted node without reranking.
+
+    Each node keeps the vector of its name when that is the text searched.
+    """
     if not extracted_nodes:
         return []
 
-    queries = [node.name.replace('\n', ' ') for node in extracted_nodes]
+    queries = [search_text(node.name) for node in extracted_nodes]
     try:
         query_vectors = await clients.embedder.create_batch(queries)
     except NotImplementedError:
@@ -532,6 +535,7 @@ async def _semantic_candidate_search(
                 *[clients.embedder.create(input_data=[query]) for query in queries]
             )
         )
+    keep_name_vectors(extracted_nodes, query_vectors)
 
     return list(
         await semaphore_gather(
@@ -912,7 +916,7 @@ async def extract_attributes_from_nodes(
         entity_types=entity_types if include_type_descriptions else None,
     )
 
-    await create_entity_node_embeddings(embedder, nodes)
+    await embed_missing_names(embedder, nodes)
 
     return nodes
 

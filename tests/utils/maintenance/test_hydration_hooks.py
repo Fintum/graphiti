@@ -467,7 +467,9 @@ def install(monkeypatch, stored: World) -> None:
         uuids = EDGES_BETWEEN.get((source_node_uuid, target_node_uuid), [])
         return [stored.stored_edges[uuid].model_copy(deep=True) for uuid in uuids]
 
-    async def search(clients, query, group_ids=None, config=None, search_filter=None):
+    async def search(
+        clients, query, group_ids=None, config=None, search_filter=None, query_vector=None
+    ):
         uuids = (
             search_filter.edge_uuids
             if search_filter is not None and search_filter.edge_uuids is not None
@@ -489,7 +491,9 @@ def install(monkeypatch, stored: World) -> None:
 
 def graph(llm: RecordingLlm) -> SimpleNamespace:
     clients = GraphitiClients.model_construct(
-        driver=SimpleNamespace(provider=GraphProvider.NEO4J),
+        driver=SimpleNamespace(
+            provider=GraphProvider.NEO4J, execute_query=AsyncMock(return_value=([], None, None))
+        ),
         llm_client=llm,
         embedder=Embedder(),
         cross_encoder=None,

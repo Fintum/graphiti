@@ -825,7 +825,9 @@ def _patch_resolve_extracted_edges_deps(monkeypatch, candidates_by_pair, related
 
     monkeypatch.setattr(EntityEdge, 'get_between_nodes', fake_get_between_nodes)
 
-    async def fake_search(clients, query, group_ids=None, config=None, search_filter=None):
+    async def fake_search(
+        clients, query, group_ids=None, config=None, search_filter=None, query_vector=None
+    ):
         if search_filter is not None and search_filter.edge_uuids is not None:
             return SearchResults(edges=list(related_by_fact.get(query, [])))
         return SearchResults()

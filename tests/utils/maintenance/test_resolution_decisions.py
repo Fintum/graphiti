@@ -390,7 +390,9 @@ async def resolve_edge_fixture(monkeypatch, llm: RecordingLlm, **options):
         pair = (source_node_uuid, target_node_uuid)
         return [stored[uuid].model_copy(deep=True) for uuid in EDGES_BETWEEN.get(pair, [])]
 
-    async def search(clients, query, group_ids=None, config=None, search_filter=None):
+    async def search(
+        clients, query, group_ids=None, config=None, search_filter=None, query_vector=None
+    ):
         uuids = (
             search_filter.edge_uuids
             if search_filter is not None and search_filter.edge_uuids is not None
