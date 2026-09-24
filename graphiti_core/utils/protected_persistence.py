@@ -36,11 +36,11 @@ if TYPE_CHECKING:
 def preserving_update(variable: str, payload: str, carry: str = '') -> str:
     variables = f'{variable}, {carry}' if carry else variable
     assignments = []
-    fields = PROTECTED_ATTRIBUTES | ({'episodes'} if variable != 'n' else set())
+    fields = PROTECTED_ATTRIBUTES | ({'episodes', 'invalidated_by'} if variable != 'n' else set())
     for key in sorted(fields):
         prior, current = f'authority.{key}', f'{variable}.{key}'
         value = f'coalesce({prior}, {current})'
-        if key in {'provenance', 'evidence_refs', 'episodes'}:
+        if key in {'provenance', 'evidence_refs', 'episodes', 'invalidated_by'}:
             value = (f'CASE WHEN {prior} IS NULL THEN {current} WHEN {current} IS NULL THEN {prior} '
                      f'ELSE {prior} + [item IN {current} WHERE NOT item IN {prior}] END')
         assignments.append(f'{current} = {value}')
