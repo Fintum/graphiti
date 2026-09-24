@@ -15,6 +15,7 @@ from graphiti_core.utils.maintenance.edge_operations import (
     resolve_extracted_edges,
     search_related_edges,
 )
+from graphiti_core.utils.maintenance.resolution_decisions import EdgeQuestion
 
 
 @pytest.fixture
@@ -341,20 +342,13 @@ async def test_resolve_extracted_edges_fast_path_deduplication(monkeypatch):
     monkeypatch.setattr(edge_ops, 'create_entity_edge_embeddings', AsyncMock(return_value=None))
     monkeypatch.setattr(EntityEdge, 'get_between_nodes', AsyncMock(return_value=[]))
 
-    # Track how many times resolve_extracted_edge is called
-    resolve_call_count = 0
+    # Track how many edges reach resolution
+    question_count = 0
 
-    async def mock_resolve_extracted_edge(
-        llm_client,
-        extracted_edge,
-        related_edges,
-        existing_edges,
-        episode,
-        edge_type_candidates=None,
-    ):
-        nonlocal resolve_call_count
-        resolve_call_count += 1
-        return extracted_edge, [], []
+    def count_edge_question(extracted_edge, related_edges, existing_edges):
+        nonlocal question_count
+        question_count += 1
+        return EdgeQuestion(extracted_edge, (), ())
 
     # Mock semaphore_gather to execute awaitable immediately
     async def immediate_gather(*aws, max_coroutines=None):
@@ -365,7 +359,8 @@ async def test_resolve_extracted_edges_fast_path_deduplication(monkeypatch):
 
     monkeypatch.setattr(edge_ops, 'semaphore_gather', immediate_gather)
     monkeypatch.setattr(edge_ops, 'search', AsyncMock(return_value=SearchResults()))
-    monkeypatch.setattr(edge_ops, 'resolve_extracted_edge', mock_resolve_extracted_edge)
+    monkeypatch.setattr(edge_ops, '_edge_question', count_edge_question)
+    monkeypatch.setattr(edge_ops, '_extract_edge_timestamps', AsyncMock(return_value=None))
 
     llm_client = MagicMock()
     clients = SimpleNamespace(
@@ -445,8 +440,8 @@ async def test_resolve_extracted_edges_fast_path_deduplication(monkeypatch):
     )
 
     # Fast path should have deduplicated the 3 identical edges to 1
-    # So resolve_extracted_edge should only be called once
-    assert resolve_call_count == 1
+    # So only one edge should reach resolution
+    assert question_count == 1
     assert len(resolved_edges) == 1
     assert invalidated_edges == []
     assert new_edges == resolved_edges  # All edges are new (no graph duplicates)
@@ -840,18 +835,12 @@ def _patch_resolve_extracted_edges_deps(monkeypatch, candidates_by_pair, related
 
     observed: list[tuple[str, list[str]]] = []
 
-    async def record_resolve(
-        llm_client,
-        extracted_edge,
-        related_edges,
-        existing_edges,
-        episode,
-        edge_type_candidates=None,
-    ):
+    def record_question(extracted_edge, related_edges, existing_edges):
         observed.append((extracted_edge.uuid, [edge.uuid for edge in related_edges]))
-        return extracted_edge, [], []
+        return EdgeQuestion(extracted_edge, (), ())
 
-    monkeypatch.setattr(edge_ops, 'resolve_extracted_edge', record_resolve)
+    monkeypatch.setattr(edge_ops, '_edge_question', record_question)
+    monkeypatch.setattr(edge_ops, '_extract_edge_timestamps', AsyncMock(return_value=None))
 
     return search_spy, observed
 

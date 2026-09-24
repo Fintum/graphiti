@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import logging
+from collections.abc import Sequence
 from datetime import datetime
 from time import time
 
@@ -50,6 +51,12 @@ from graphiti_core.utils.maintenance.identity_constraints import (
     merge_provenance,
     protected_attributes,
     scopes_compatible,
+)
+from graphiti_core.utils.maintenance.resolution_decisions import (
+    EdgeQuestion,
+    EdgeVerdict,
+    LlmResolutionDecisions,
+    ResolutionDecisions,
 )
 from graphiti_core.utils.text_utils import concatenate_episodes
 
@@ -339,8 +346,13 @@ async def resolve_extracted_edges(
     edge_type_map: dict[tuple[str, str], list[str]],
     existing_edges_override: list[EntityEdge] | None = None,
     acl: EnrichmentAcl | None = None,
+    decisions: ResolutionDecisions | None = None,
 ) -> tuple[list[EntityEdge], list[EntityEdge], list[EntityEdge]]:
     """Resolve extracted edges against existing graph context.
+
+    Every edge the literal fast path does not settle and that has candidates is judged in a single
+    ``decisions.resolve_edges`` call, and the new edges are dated in a single ``date_edges`` call;
+    ``decisions=None`` means today's LLM prompts.
 
     Returns
     -------
@@ -491,36 +503,35 @@ async def resolve_extracted_edges(
         edge_types_lst.append(extracted_edge_types)
 
     # resolve edges with related edges in the graph and find invalidation candidates
-    results: list[tuple[EntityEdge, list[EntityEdge], list[EntityEdge]]] = list(
-        await semaphore_gather(
-            *[
-                resolve_extracted_edge(
-                    llm_client,
-                    extracted_edge,
-                    related_edges,
-                    existing_edges,
-                    episode,
-                    extracted_edge_types,
-                )
-                for extracted_edge, related_edges, existing_edges, extracted_edge_types in zip(
-                    extracted_edges,
-                    related_edges_lists,
-                    edge_invalidation_candidates,
-                    edge_types_lst,
-                    strict=True,
-                )
-            ]
+    decisions = decisions or LlmResolutionDecisions(llm_client)
+    questions = [
+        _edge_question(extracted_edge, related_edges, existing_edges)
+        for extracted_edge, related_edges, existing_edges in zip(
+            extracted_edges, related_edges_lists, edge_invalidation_candidates, strict=True
         )
+    ]
+    answers: list[EntityEdge | EdgeVerdict | None] = [
+        _literal_duplicate(question, episode) for question in questions
+    ]
+    asked = [
+        index
+        for index, question in enumerate(questions)
+        if answers[index] is None and (question.duplicates or question.invalidations)
+    ]
+    if asked:
+        verdicts = await decisions.resolve_edges(episode, [questions[index] for index in asked])
+        for index, verdict in zip(asked, verdicts, strict=True):
+            answers[index] = verdict
+    results = await _apply_edge_answers(
+        llm_client, decisions, questions, answers, episode, edge_types_lst
     )
 
     resolved_edges: list[EntityEdge] = []
     invalidated_edges: list[EntityEdge] = []
     new_edges: list[EntityEdge] = []
-    for extracted_edge, result in zip(extracted_edges, results, strict=True):
-        resolved_edge = result[0]
-        invalidated_edge_chunk = result[1]
-        # result[2] is duplicate_edges list
-
+    for extracted_edge, (resolved_edge, invalidated_edge_chunk) in zip(
+        extracted_edges, results, strict=True
+    ):
         resolved_edges.append(resolved_edge)
         invalidated_edges.extend(invalidated_edge_chunk)
 
@@ -655,6 +666,34 @@ async def resolve_extracted_edge(
     tuple[EntityEdge, list[EntityEdge], list[EntityEdge]]
         The resolved edge, any duplicates, and edges to invalidate.
     """
+    question = _edge_question(extracted_edge, related_edges, existing_edges)
+    answer: EntityEdge | EdgeVerdict | None = _literal_duplicate(question, episode)
+    duplicate_edges: list[EntityEdge] = []
+    if answer is None and (question.duplicates or question.invalidations):
+        duplicate_edges, contradicted_edges = await _resolve_edge_with_llm(llm_client, question)
+        answer = EdgeVerdict(
+            duplicate_edges[0] if duplicate_edges else None, tuple(contradicted_edges)
+        )
+    [(resolved_edge, invalidated_edges)] = await _apply_edge_answers(
+        llm_client,
+        LlmResolutionDecisions(llm_client),
+        [question],
+        [answer],
+        episode,
+        [edge_type_candidates],
+    )
+    return resolved_edge, invalidated_edges, duplicate_edges
+
+
+def _edge_question(
+    extracted_edge: EntityEdge,
+    related_edges: list[EntityEdge],
+    existing_edges: list[EntityEdge],
+) -> EdgeQuestion:
+    """Keep the edges an extracted edge may restate or contradict without crossing its scope.
+
+    Duplicates must also share the relation name, the group and both endpoints.
+    """
     related_edges = [edge for edge in related_edges
                      if scopes_compatible(extracted_edge.attributes, edge.attributes)
                      and edge.name == extracted_edge.name
@@ -664,40 +703,18 @@ async def resolve_extracted_edge(
     existing_edges = [edge for edge in existing_edges
                       if scopes_compatible(extracted_edge.attributes, edge.attributes)
                       and edge.group_id == extracted_edge.group_id]
-    if len(related_edges) == 0 and len(existing_edges) == 0:
-        # Still extract custom attributes and timestamps even when no dedup needed
-        edge_model = edge_type_candidates.get(extracted_edge.name) if edge_type_candidates else None
-        if edge_model is not None and len(edge_model.model_fields) != 0:
-            edge_attributes_context = {
-                'fact': extracted_edge.fact,
-                'reference_time': episode.valid_at if episode is not None else None,
-                'existing_attributes': extracted_edge.attributes,
-            }
-            edge_attributes_response = await llm_client.generate_response(
-                prompt_library.extract_edges.extract_attributes(edge_attributes_context),
-                response_model=edge_model,  # type: ignore
-                model_size=ModelSize.small,
-                prompt_name='extract_edges.extract_attributes',
-                attribute_extraction=True,
-            )
-            merged, _ = apply_capped_attributes(
-                edge_attributes_response,
-                edge_model,
-                extracted_edge.attributes,
-                merge_mode='replace',
-                prompt_name='extract_edges.extract_attributes',
-                entity_uuid=extracted_edge.uuid,
-                group_id=extracted_edge.group_id,
-            )
-            extracted_edge.attributes = merged
+    return EdgeQuestion(extracted_edge, tuple(related_edges), tuple(existing_edges))
 
-        await _extract_edge_timestamps(llm_client, extracted_edge, episode)
 
-        return extracted_edge, [], []
+def _literal_duplicate(question: EdgeQuestion, episode: EpisodicNode) -> EntityEdge | None:
+    """Settle a question without a verdict when a duplicate states the same fact verbatim.
 
+    The duplicate is credited with the episode and with the provenance of the extracted edge.
+    """
+    extracted_edge = question.extracted
     # Fast path: if the fact text and endpoints already exist verbatim, reuse the matching edge.
     normalized_fact = _normalize_string_exact(extracted_edge.fact)
-    for edge in related_edges:
+    for edge in question.duplicates:
         if (
             edge.source_node_uuid == extracted_edge.source_node_uuid
             and edge.target_node_uuid == extracted_edge.target_node_uuid
@@ -707,9 +724,20 @@ async def resolve_extracted_edge(
             resolved.attributes = merge_provenance(resolved.attributes, extracted_edge.attributes)
             if episode is not None and episode.uuid not in resolved.episodes:
                 resolved.episodes.append(episode.uuid)
-            return resolved, [], []
+            return resolved
+    return None
 
-    start = time()
+
+async def _resolve_edge_with_llm(
+    llm_client: LLMClient, question: EdgeQuestion
+) -> tuple[list[EntityEdge], list[EntityEdge]]:
+    """Ask today's dedupe prompt which offered edges the extracted edge restates and contradicts.
+
+    Returns every in-range duplicate in the order the LLM named them, then the contradicted edges.
+    """
+    extracted_edge = question.extracted
+    related_edges = list(question.duplicates)
+    existing_edges = list(question.invalidations)
 
     # Prepare context for LLM with continuous indexing
     related_edges_context = [{'idx': i, 'fact': edge.fact} for i, edge in enumerate(related_edges)]
@@ -758,15 +786,6 @@ async def resolve_extracted_edge(
 
     duplicate_fact_ids: list[int] = [i for i in duplicate_facts if 0 <= i < len(related_edges)]
 
-    resolved_edge = extracted_edge
-    for duplicate_fact_id in duplicate_fact_ids:
-        resolved_edge = related_edges[duplicate_fact_id]
-        break
-
-    if duplicate_fact_ids and episode is not None:
-        resolved_edge.episodes = list(dict.fromkeys([*resolved_edge.episodes, episode.uuid]))
-        resolved_edge.attributes = merge_provenance(resolved_edge.attributes, extracted_edge.attributes)
-
     # Process contradicted facts (continuous indexing across both lists)
     contradicted_facts: list[int] = response_object.contradicted_facts
     invalidation_candidates: list[EntityEdge] = []
@@ -791,46 +810,127 @@ async def resolve_extracted_edge(
                 # From FACT INVALIDATION CANDIDATES (adjust index by offset)
                 invalidation_candidates.append(existing_edges[idx - invalidation_idx_offset])
 
+    return [related_edges[idx] for idx in duplicate_fact_ids], invalidation_candidates
+
+
+async def _apply_edge_answers(
+    llm_client: LLMClient,
+    decisions: ResolutionDecisions,
+    questions: list[EdgeQuestion],
+    answers: list[EntityEdge | EdgeVerdict | None],
+    episode: EpisodicNode,
+    edge_types_lst: Sequence[dict[str, type[BaseModel]] | None],
+) -> list[tuple[EntityEdge, list[EntityEdge]]]:
+    """Apply every answer, date the edges that stay new in one call, then settle their validity.
+
+    Literal duplicates are neither dated nor revisited, and only a verdict can invalidate edges.
+    """
+    applied = await semaphore_gather(
+        *[
+            _apply_edge_answer(llm_client, question, answer, episode, edge_type_candidates)
+            for question, answer, edge_type_candidates in zip(
+                questions, answers, edge_types_lst, strict=True
+            )
+        ]
+    )
+    # Extract timestamps for new edges (duplicated edges retain their existing timestamps)
+    undated = [
+        resolved_edge
+        for question, answer, (resolved_edge, _) in zip(questions, answers, applied, strict=True)
+        if not isinstance(answer, EntityEdge) and resolved_edge.uuid == question.extracted.uuid
+    ]
+    if undated:
+        await decisions.date_edges(episode, undated)
+    return [
+        (
+            resolved_edge,
+            _settle_edge_validity(resolved_edge, contradicted)
+            if isinstance(answer, EdgeVerdict)
+            else [],
+        )
+        for answer, (resolved_edge, contradicted) in zip(answers, applied, strict=True)
+    ]
+
+
+async def _apply_edge_answer(
+    llm_client: LLMClient,
+    question: EdgeQuestion,
+    answer: EntityEdge | EdgeVerdict | None,
+    episode: EpisodicNode,
+    edge_type_candidates: dict[str, type[BaseModel]] | None,
+) -> tuple[EntityEdge, list[EntityEdge]]:
+    """Resolve one edge from its answer and return it with the contradicted edges to weigh.
+
+    A verdict only counts for the edges its question offered: a duplicate outside the duplicates,
+    or a contradicted edge the question never offered, is ignored.
+    """
+    extracted_edge = question.extracted
+    if isinstance(answer, EntityEdge):
+        return answer, []
+    if answer is None:
+        # Still extract custom attributes and timestamps even when no dedup needed
+        await _extract_edge_attributes(llm_client, extracted_edge, episode, edge_type_candidates)
+        return extracted_edge, []
+
+    resolved_edge = extracted_edge
+    if answer.duplicate is not None and answer.duplicate.uuid in {
+        edge.uuid for edge in question.duplicates
+    }:
+        resolved_edge = answer.duplicate
+        if episode is not None:
+            resolved_edge.episodes = list(dict.fromkeys([*resolved_edge.episodes, episode.uuid]))
+            resolved_edge.attributes = merge_provenance(
+                resolved_edge.attributes, extracted_edge.attributes
+            )
+
     # Only extract structured attributes if the edge's relation_type matches an allowed custom type
     # AND the edge model exists for this node pair signature
-    edge_model = edge_type_candidates.get(resolved_edge.name) if edge_type_candidates else None
-    if edge_model is not None and len(edge_model.model_fields) != 0:
-        edge_attributes_context = {
-            'fact': resolved_edge.fact,
-            'reference_time': episode.valid_at if episode is not None else None,
-            'existing_attributes': resolved_edge.attributes,
-        }
-
-        edge_attributes_response = await llm_client.generate_response(
-            prompt_library.extract_edges.extract_attributes(edge_attributes_context),
-            response_model=edge_model,  # type: ignore
-            model_size=ModelSize.small,
-            prompt_name='extract_edges.extract_attributes',
-            attribute_extraction=True,
-        )
-
-        merged, _ = apply_capped_attributes(
-            edge_attributes_response,
-            edge_model,
-            resolved_edge.attributes,
-            merge_mode='replace',
-            prompt_name='extract_edges.extract_attributes',
-            entity_uuid=resolved_edge.uuid,
-            group_id=resolved_edge.group_id,
-        )
-        resolved_edge.attributes = merged
-    else:
+    if not await _extract_edge_attributes(llm_client, resolved_edge, episode, edge_type_candidates):
         resolved_edge.attributes = protected_attributes(resolved_edge.attributes)
 
-    # Extract timestamps for new edges (duplicated edges retain their existing timestamps)
-    if resolved_edge.uuid == extracted_edge.uuid:
-        await _extract_edge_timestamps(llm_client, resolved_edge, episode)
+    offered = {edge.uuid for edge in (*question.duplicates, *question.invalidations)}
+    return resolved_edge, [edge for edge in answer.contradicted if edge.uuid in offered]
 
-    end = time()
-    logger.debug(
-        f'Resolved Edge: {extracted_edge.uuid} -> {resolved_edge.uuid}, in {(end - start) * 1000} ms'
+
+async def _extract_edge_attributes(
+    llm_client: LLMClient,
+    edge: EntityEdge,
+    episode: EpisodicNode | None,
+    edge_type_candidates: dict[str, type[BaseModel]] | None,
+) -> bool:
+    """Extract the custom attributes the edge's type declares; False when it declares none."""
+    edge_model = edge_type_candidates.get(edge.name) if edge_type_candidates else None
+    if edge_model is None or len(edge_model.model_fields) == 0:
+        return False
+
+    edge_attributes_context = {
+        'fact': edge.fact,
+        'reference_time': episode.valid_at if episode is not None else None,
+        'existing_attributes': edge.attributes,
+    }
+    edge_attributes_response = await llm_client.generate_response(
+        prompt_library.extract_edges.extract_attributes(edge_attributes_context),
+        response_model=edge_model,
+        model_size=ModelSize.small,
+        prompt_name='extract_edges.extract_attributes',
+        attribute_extraction=True,
     )
+    edge.attributes, _ = apply_capped_attributes(
+        edge_attributes_response,
+        edge_model,
+        edge.attributes,
+        merge_mode='replace',
+        prompt_name='extract_edges.extract_attributes',
+        entity_uuid=edge.uuid,
+        group_id=edge.group_id,
+    )
+    return True
 
+
+def _settle_edge_validity(
+    resolved_edge: EntityEdge, invalidation_candidates: list[EntityEdge]
+) -> list[EntityEdge]:
+    """Expire the resolved edge if a contradicted edge is more recent; return the edges it invalidates."""
     now = utc_now()
 
     if resolved_edge.invalid_at and not resolved_edge.expired_at:
@@ -853,12 +953,7 @@ async def resolve_extracted_edge(
                 break
 
     # Determine which contradictory edges need to be expired
-    invalidated_edges: list[EntityEdge] = resolve_edge_contradictions(
-        resolved_edge, invalidation_candidates
-    )
-    duplicate_edges: list[EntityEdge] = [related_edges[idx] for idx in duplicate_fact_ids]
-
-    return resolved_edge, invalidated_edges, duplicate_edges
+    return resolve_edge_contradictions(resolved_edge, invalidation_candidates)
 
 
 async def filter_existing_duplicate_of_edges(

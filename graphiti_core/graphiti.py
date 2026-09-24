@@ -107,6 +107,7 @@ from graphiti_core.utils.maintenance.node_operations import (
     extract_nodes_split,
     resolve_extracted_nodes,
 )
+from graphiti_core.utils.maintenance.resolution_decisions import ResolutionDecisions
 from graphiti_core.utils.ontology_utils.entity_types_utils import validate_entity_types
 from graphiti_core.utils.text_utils import MAX_SUMMARY_CHARS
 
@@ -762,7 +763,8 @@ class Graphiti:
             edge_type_map: dict[tuple[str, str], list[str]] | None = None,
             saga: str | None = None,
             get_previous_episodes: bool = False,
-            acl: EnrichmentAcl | None = None
+            acl: EnrichmentAcl | None = None,
+            decisions: ResolutionDecisions | None = None,
         ) -> tuple[list[EntityNode], list[EntityEdge], list[EntityEdge], dict[str, str]]:
         """Step 2. Resolve nodes and edges, and extract node attributes, against candidates the acl allows."""
 
@@ -793,6 +795,7 @@ class Graphiti:
             previous_episodes,
             entity_types,
             acl=acl,
+            decisions=decisions,
         )
 
         # Check existing edges and compute embeddings
@@ -807,6 +810,7 @@ class Graphiti:
             edge_types or {},
             edge_type_map or edge_type_map_default,
             acl=acl,
+            decisions=decisions,
         )
 
         # Extract node attributes + summary + embeddings

@@ -58,6 +58,11 @@ from graphiti_core.utils.maintenance.identity_constraints import (
     protected_attributes,
     require_same_identity,
 )
+from graphiti_core.utils.maintenance.resolution_decisions import (
+    LlmResolutionDecisions,
+    NodeQuestion,
+    ResolutionDecisions,
+)
 from graphiti_core.utils.text_utils import (
     MAX_SUMMARY_CHARS,
     concatenate_episodes,
@@ -717,6 +722,38 @@ async def _resolve_with_llm(
             state.duplicate_pairs.append((extracted_node, resolved_node))
 
 
+def _apply_node_verdicts(
+    state: DedupResolutionState,
+    questions: list[NodeQuestion],
+    verdicts: list[EntityNode | None],
+) -> None:
+    """Commit the verdicts that name a candidate offered in the call with a compatible identity.
+
+    Any other verdict leaves the extracted node new. The offered candidates are those of every
+    question deduplicated by uuid in question order, the list today's prompt chooses from.
+    """
+    offered = {
+        candidate.uuid: candidate
+        for candidate in _merge_candidate_nodes(
+            [candidate for question in questions for candidate in question.candidates], None
+        )
+    }
+    for idx, question, verdict in zip(state.unresolved_indices, questions, verdicts, strict=True):
+        extracted_node = question.extracted
+        candidate = offered.get(verdict.uuid) if verdict is not None else None
+        resolved_node = (
+            _promote_resolved_node(extracted_node, candidate)
+            if candidate is not None and identities_compatible(extracted_node, candidate)
+            else extracted_node
+        )
+        duplicate_pairs = (
+            [(extracted_node, resolved_node)] if resolved_node.uuid != extracted_node.uuid else []
+        )
+        _commit_resolution(
+            state, resolved_node, {extracted_node.uuid: resolved_node.uuid}, duplicate_pairs, idx
+        )
+
+
 async def resolve_extracted_nodes(
     clients: GraphitiClients,
     extracted_nodes: list[EntityNode],
@@ -725,8 +762,13 @@ async def resolve_extracted_nodes(
     entity_types: dict[str, type[BaseModel]] | None = None,
     existing_nodes_override: list[EntityNode] | None = None,
     acl: EnrichmentAcl | None = None,
+    decisions: ResolutionDecisions | None = None,
 ) -> tuple[list[EntityNode], dict[str, str], list[tuple[EntityNode, EntityNode]]]:
-    """Resolve nodes with semantic retrieval first, then deterministic and LLM dedup."""
+    """Resolve nodes with semantic retrieval first, then deterministic dedup and the decisions.
+
+    Only the nodes the deterministic passes leave open reach the decisions; None means today's
+    LLM prompt.
+    """
     llm_client = clients.llm_client
     candidate_nodes_by_extracted = await _collect_candidate_nodes(
         clients,
@@ -765,23 +807,13 @@ async def resolve_extracted_nodes(
         state.unresolved_indices.append(idx)
 
     if state.unresolved_indices:
-        llm_candidate_nodes = _merge_candidate_nodes(
-            [
-                candidate
-                for idx in state.unresolved_indices
-                for candidate in candidate_nodes_by_extracted[idx]
-            ],
-            None,
-        )
-        await _resolve_with_llm(
-            llm_client,
-            extracted_nodes,
-            _build_candidate_indexes(llm_candidate_nodes),
-            state,
-            episode,
-            previous_episodes,
-            entity_types,
-        )
+        questions = [
+            NodeQuestion(extracted_nodes[idx], tuple(candidate_nodes_by_extracted[idx]))
+            for idx in state.unresolved_indices
+        ]
+        resolver = decisions or LlmResolutionDecisions(llm_client, entity_types)
+        verdicts = await resolver.resolve_nodes(episode, previous_episodes or [], questions)
+        _apply_node_verdicts(state, questions, verdicts)
 
     if not state.unresolved_indices and not any(candidate_nodes_by_extracted):
         logger.debug('No semantic dedup candidates found; keeping all extracted nodes as new')
