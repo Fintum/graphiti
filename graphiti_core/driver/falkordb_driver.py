@@ -157,6 +157,21 @@ def _get_index_build_state(client: Any, database: str) -> _IndexBuildState:
         return state
 
 
+def forget_indices(database: str) -> None:
+    """Mark `database` unbuilt for every client of this process; call it after deleting the graph.
+
+    FalkorDB drops a graph's indices with the graph and this driver never sees it, so the next
+    build_indices_and_constraints() would skip every query and leave the recreated graph bare.
+    Clients that cannot be weakly referenced keep their build state on themselves and are not
+    reached (falkordb.asyncio.FalkorDB can be); other processes keep their own state.
+    """
+    with _INDEX_STATE_MUTEX:
+        for per_database in list(_INDEX_STATE.values()):
+            state = per_database.get(database)
+            if state is not None:
+                state.built = False
+
+
 def _strip_nul_bytes(value: Any) -> Any:
     if isinstance(value, str):
         return value.replace('\x00', '')
@@ -362,6 +377,12 @@ class FalkorDriver(GraphDriver):
             await self.client.connection.close()
 
     async def delete_all_indexes(self) -> None:
+        try:
+            await self._drop_listed_indexes()
+        finally:
+            forget_indices(self._database)
+
+    async def _drop_listed_indexes(self) -> None:
         result = await self.execute_query('CALL db.indexes()')
         if not result:
             return
@@ -425,7 +446,8 @@ class FalkorDriver(GraphDriver):
 
         Every query is attempted even if an earlier one failed, so a rejected index never
         hides the ones queued behind it. A completed build is remembered per
-        (client, database), so repeat calls are free; `delete_existing` forces a rebuild.
+        (client, database), so repeat calls are free; `delete_existing` forces a rebuild, and
+        whoever deletes the graph calls forget_indices() so the next build runs again.
         """
         state = _get_index_build_state(self.client, self._database)
 

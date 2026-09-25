@@ -41,6 +41,9 @@ except ImportError:
     FalkorDriver = None
     HAS_FALKORDB = False
 
+if HAS_FALKORDB:
+    from graphiti_core.driver.falkordb_driver import _INDEX_STATE, forget_indices
+
 
 class TestFalkorDriver:
     """Comprehensive test suite for FalkorDB driver."""
@@ -442,6 +445,24 @@ class RecordingExecutor:
         return [query for query in self.queries if query in INDEX_QUERIES]
 
 
+class IndexCatalogExecutor(RecordingExecutor):
+    """Answers CALL db.indexes() the way FalkorDB lists one range and one fulltext index."""
+
+    CATALOG = [
+        {
+            'label': 'Entity',
+            'entitytype': 'NODE',
+            'types': {'uuid': ['RANGE'], 'name': ['FULLTEXT']},
+        }
+    ]
+
+    async def __call__(self, query: str, **kwargs: Any):
+        result = await super().__call__(query, **kwargs)
+        if query == 'CALL db.indexes()':
+            return self.CATALOG, ['label', 'entitytype', 'types'], None
+        return result
+
+
 def build_driver(client: MagicMock | None = None, database: str = 'default_db'):
     """FalkorDriver wired to a recording executor, with index deletion stubbed out."""
     client = client if client is not None else MagicMock()
@@ -640,6 +661,77 @@ class TestFalkorDriverIndexLifecycle:
 
         assert len(first_executor.queries) == INDEX_QUERY_COUNT
         assert len(second_executor.queries) == INDEX_QUERY_COUNT
+
+    @pytest.mark.asyncio
+    async def test_forgetting_a_database_rebuilds_its_indices_on_the_next_build(self):
+        """A deleted graph is recreated bare, so its next build must not be skipped."""
+        driver, executor = build_driver(database='forgotten_graph')
+        await driver.build_indices_and_constraints()
+
+        forget_indices('forgotten_graph')
+
+        assert driver.indices_built is False
+        await driver.build_indices_and_constraints()
+        assert len(executor.index_queries) == 2 * INDEX_QUERY_COUNT
+        assert driver.indices_built is True
+
+    @pytest.mark.asyncio
+    async def test_forgetting_reaches_every_client_of_the_process(self):
+        """The graph may be deleted through a client other than the one that will rewrite it."""
+        first, first_executor = build_driver(client=MagicMock(), database='graph_of_two_clients')
+        second, second_executor = build_driver(client=MagicMock(), database='graph_of_two_clients')
+        await first.build_indices_and_constraints()
+        await second.build_indices_and_constraints()
+
+        forget_indices('graph_of_two_clients')
+        await first.build_indices_and_constraints()
+        await second.build_indices_and_constraints()
+
+        assert len(first_executor.index_queries) == 2 * INDEX_QUERY_COUNT
+        assert len(second_executor.index_queries) == 2 * INDEX_QUERY_COUNT
+
+    @pytest.mark.asyncio
+    async def test_forgetting_one_database_keeps_the_others_built(self):
+        client = MagicMock()
+        forgotten, _ = build_driver(client=client, database='purged_org')
+        kept, kept_executor = build_driver(client=client, database='surviving_org')
+        await forgotten.build_indices_and_constraints()
+        await kept.build_indices_and_constraints()
+
+        forget_indices('purged_org')
+        await kept.build_indices_and_constraints()
+
+        assert forgotten.indices_built is False
+        assert kept.indices_built is True
+        assert len(kept_executor.index_queries) == INDEX_QUERY_COUNT
+
+    @pytest.mark.asyncio
+    async def test_forgetting_a_database_never_built_is_harmless(self):
+        forget_indices('graph_never_built')
+        forget_indices('graph_never_built')
+
+        registered = [database for states in list(_INDEX_STATE.values()) for database in states]
+        assert 'graph_never_built' not in registered
+        driver, executor = build_driver(database='graph_never_built')
+        await driver.build_indices_and_constraints()
+        await driver.build_indices_and_constraints()
+        assert len(executor.index_queries) == INDEX_QUERY_COUNT
+
+    @pytest.mark.asyncio
+    async def test_deleting_every_index_forgets_the_build(self):
+        driver = FalkorDriver(falkor_db=MagicMock(), database='graph_without_indices')
+        executor = IndexCatalogExecutor()
+        driver.execute_query = executor  # type: ignore[method-assign]
+        await driver.build_indices_and_constraints()
+
+        await driver.delete_all_indexes()
+
+        assert 'DROP INDEX ON :Entity(uuid)' in executor.queries
+        assert 'DROP FULLTEXT INDEX FOR (n:Entity) ON (n.name)' in executor.queries
+        assert driver.indices_built is False
+        await driver.build_indices_and_constraints()
+        assert len(executor.index_queries) == 2 * INDEX_QUERY_COUNT
+        assert driver.indices_built is True
 
     def test_build_survives_many_event_loops(self):
         """The worker pattern: one asyncio.run() per job, many loops in one process."""
