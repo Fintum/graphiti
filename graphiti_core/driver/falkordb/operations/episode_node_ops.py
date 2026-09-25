@@ -32,6 +32,9 @@ from graphiti_core.nodes import EpisodicNode
 
 logger = logging.getLogger(__name__)
 
+# FalkorDB's range index on the valid_at string ignores an upper bound: compare outside it.
+_FALKORDB_REFERENCE_BOUND = 'toString(e.valid_at) <= $reference_time'
+
 
 class FalkorEpisodeNodeOperations(EpisodeNodeOperations):
     async def save(
@@ -228,7 +231,9 @@ class FalkorEpisodeNodeOperations(EpisodeNodeOperations):
             query = (
                 """
                 MATCH (s:Saga {name: $saga_name, group_id: $group_id})-[:HAS_EPISODE]->(e:Episodic)
-                WHERE e.valid_at <= $reference_time
+                WHERE """
+                + _FALKORDB_REFERENCE_BOUND
+                + """
                 """
                 + source_clause
                 + """
@@ -254,7 +259,9 @@ class FalkorEpisodeNodeOperations(EpisodeNodeOperations):
             query = (
                 """
                 MATCH (e:Episodic)
-                WHERE e.valid_at <= $reference_time
+                WHERE """
+                + _FALKORDB_REFERENCE_BOUND
+                + """
                 """
                 + group_clause
                 + source_clause

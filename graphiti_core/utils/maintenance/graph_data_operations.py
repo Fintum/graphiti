@@ -28,7 +28,15 @@ from graphiti_core.nodes import EpisodeType, EpisodicNode, get_episodic_node_fro
 
 EPISODE_WINDOW_LEN = 3
 
+# FalkorDB's range index on the valid_at string ignores an upper bound: compare outside it.
+_FALKORDB_REFERENCE_BOUND: LiteralString = 'toString(e.valid_at) <= $reference_time'
+_REFERENCE_BOUND: LiteralString = 'e.valid_at <= $reference_time'
+
 logger = logging.getLogger(__name__)
+
+
+def _reference_bound(provider: GraphProvider) -> LiteralString:
+    return _FALKORDB_REFERENCE_BOUND if provider == GraphProvider.FALKORDB else _REFERENCE_BOUND
 
 
 async def clear_data(driver: GraphDriver, group_ids: list[str] | None = None):
@@ -104,7 +112,7 @@ async def retrieve_episodes(
         records, _, _ = await driver.execute_query(
             f"""
             MATCH (s:Saga {{name: $saga_name, group_id: $group_id}})-[:HAS_EPISODE]->(e:Episodic)
-            WHERE e.valid_at <= $reference_time
+            WHERE {_reference_bound(driver.provider)}
             {source_filter}
             RETURN
             """
@@ -140,8 +148,8 @@ async def retrieve_episodes(
     query: LiteralString = (
         """
                                     MATCH (e:Episodic)
-                                    WHERE e.valid_at <= $reference_time
-                                    """
+                                    WHERE """
+        + _reference_bound(driver.provider)
         + query_filter
         + """
         RETURN
