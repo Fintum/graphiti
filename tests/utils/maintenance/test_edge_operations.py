@@ -129,7 +129,7 @@ async def test_resolve_extracted_edge_exact_fact_short_circuit(
         EntityEdge(
             source_node_uuid='source_uuid',
             target_node_uuid='target_uuid',
-            name='related_edge',
+            name='test_edge',
             group_id='group_1',
             fact=' related FACT  ',
             episodes=['episode_2'],

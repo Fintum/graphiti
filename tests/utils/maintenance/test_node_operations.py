@@ -34,6 +34,7 @@ from graphiti_core.utils.maintenance.node_operations import (
 
 def _make_clients():
     driver = MagicMock()
+    driver.graph_operations_interface.node_get_by_uuids = AsyncMock(return_value=[])
     embedder = MagicMock()
     cross_encoder = MagicMock()
     llm_client = MagicMock()
@@ -95,8 +96,8 @@ async def test_resolve_nodes_exact_match_skips_llm(monkeypatch):
 async def test_resolve_nodes_exact_match_promotes_generic_candidate_type(monkeypatch):
     clients, llm_generate = _make_clients()
 
-    candidate = EntityNode(name='Audrey', group_id='group', labels=['Entity'])
-    extracted = EntityNode(name='Audrey', group_id='group', labels=['Entity', 'Person'])
+    candidate = EntityNode(name='Apollo', group_id='group', labels=['Entity'])
+    extracted = EntityNode(name='Apollo', group_id='group', labels=['Entity', 'Topic'])
     monkeypatch.setattr(
         'graphiti_core.utils.maintenance.node_operations._semantic_candidate_search',
         _semantic_candidates([[candidate]]),
@@ -110,9 +111,34 @@ async def test_resolve_nodes_exact_match_promotes_generic_candidate_type(monkeyp
     )
 
     assert resolved[0].uuid == candidate.uuid
-    assert set(resolved[0].labels) == {'Entity', 'Person'}
-    assert set(candidate.labels) == {'Entity', 'Person'}
+    assert set(resolved[0].labels) == {'Entity', 'Topic'}
+    assert set(candidate.labels) == {'Entity', 'Topic'}
     assert uuid_map[extracted.uuid] == candidate.uuid
+    llm_generate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resolve_nodes_person_homonym_of_generic_candidate_stays_new_without_llm(monkeypatch):
+    clients, llm_generate = _make_clients()
+
+    candidate = EntityNode(name='Audrey', group_id='group', labels=['Entity'])
+    extracted = EntityNode(name='Audrey', group_id='group', labels=['Entity', 'Person'])
+    monkeypatch.setattr(
+        'graphiti_core.utils.maintenance.node_operations._semantic_candidate_search',
+        _semantic_candidates([[candidate]]),
+    )
+
+    resolved, uuid_map, duplicates = await resolve_extracted_nodes(
+        clients,
+        [extracted],
+        episode=_make_episode(),
+        previous_episodes=[],
+    )
+
+    assert resolved == [extracted]
+    assert uuid_map == {extracted.uuid: extracted.uuid}
+    assert duplicates == []
+    assert candidate.labels == ['Entity']
     llm_generate.assert_not_awaited()
 
 
@@ -396,9 +422,9 @@ def test_resolve_with_similarity_exact_match_updates_state():
 
 
 def test_resolve_with_similarity_short_name_exact_match_resolves_deterministically():
-    """Short names like 'Nate' should resolve via exact match without hitting the LLM."""
-    candidate = EntityNode(name='Nate', group_id='group', labels=['Entity', 'Person'])
-    extracted = EntityNode(name='Nate', group_id='group', labels=['Entity', 'Person'])
+    """Short names like 'Rust' should resolve via exact match without hitting the LLM."""
+    candidate = EntityNode(name='Rust', group_id='group', labels=['Entity', 'Topic'])
+    extracted = EntityNode(name='Rust', group_id='group', labels=['Entity', 'Topic'])
 
     indexes = _build_candidate_indexes([candidate])
     state = DedupResolutionState(resolved_nodes=[None], uuid_map={}, unresolved_indices=[])
@@ -579,6 +605,49 @@ async def test_resolve_with_llm_updates_unresolved(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_resolve_with_llm_promotes_generic_candidate_type(monkeypatch):
+    extracted = EntityNode(name='Apollo', group_id='group', labels=['Entity', 'Topic'])
+    candidate = EntityNode(name='Apollo', group_id='group', labels=['Entity'])
+
+    indexes = _build_candidate_indexes([candidate])
+    state = DedupResolutionState(resolved_nodes=[None], uuid_map={}, unresolved_indices=[0])
+
+    monkeypatch.setattr(
+        'graphiti_core.utils.maintenance.node_operations.prompt_library.dedupe_nodes.nodes',
+        lambda context: ['prompt'],
+    )
+
+    llm_client = MagicMock()
+    llm_client.generate_response = AsyncMock(
+        return_value={
+            'entity_resolutions': [
+                {
+                    'id': 0,
+                    'name': 'Apollo',
+                    'duplicate_candidate_id': 0,
+                }
+            ]
+        }
+    )
+
+    await _resolve_with_llm(
+        llm_client,
+        [extracted],
+        indexes,
+        state,
+        episode=_make_episode(),
+        previous_episodes=[],
+        entity_types=None,
+    )
+
+    assert state.resolved_nodes[0].uuid == candidate.uuid
+    assert set(state.resolved_nodes[0].labels) == {'Entity', 'Topic'}
+    assert set(candidate.labels) == {'Entity', 'Topic'}
+    assert state.uuid_map[extracted.uuid] == candidate.uuid
+    assert state.duplicate_pairs == [(extracted, candidate)]
+
+
+@pytest.mark.asyncio
+async def test_resolve_with_llm_cannot_merge_person_into_generic_homonym(monkeypatch):
     extracted = EntityNode(name='Audrey', group_id='group', labels=['Entity', 'Person'])
     candidate = EntityNode(name='Audrey', group_id='group', labels=['Entity'])
 
@@ -613,11 +682,10 @@ async def test_resolve_with_llm_promotes_generic_candidate_type(monkeypatch):
         entity_types=None,
     )
 
-    assert state.resolved_nodes[0].uuid == candidate.uuid
-    assert set(state.resolved_nodes[0].labels) == {'Entity', 'Person'}
-    assert set(candidate.labels) == {'Entity', 'Person'}
-    assert state.uuid_map[extracted.uuid] == candidate.uuid
-    assert state.duplicate_pairs == [(extracted, candidate)]
+    assert state.resolved_nodes[0] is extracted
+    assert state.uuid_map == {extracted.uuid: extracted.uuid}
+    assert state.duplicate_pairs == []
+    assert candidate.labels == ['Entity']
 
 
 @pytest.mark.asyncio

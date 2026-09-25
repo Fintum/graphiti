@@ -195,6 +195,45 @@ class TestExtractNodesSmallInput:
 
         from pydantic import BaseModel
 
+        class Hobby(BaseModel):
+            """A leisure activity."""
+
+            pass
+
+        llm_generate.return_value = {
+            'extracted_entities': [
+                {'name': 'Pottery', 'entity_type_id': 0},  # Default Entity
+                {'name': 'Pottery', 'entity_type_id': 1},  # Hobby
+                {'name': 'Painting', 'entity_type_id': 1},
+            ]
+        }
+
+        episode = _make_episode(
+            content=(
+                'Caroline: Have you tried pottery yet?\n'
+                'Melanie: Pottery and painting are my favourite hobbies!'
+            ),
+            source=EpisodeType.message,
+        )
+
+        nodes, _ = await extract_nodes(
+            clients,
+            episode,
+            previous_episodes=[],
+            entity_types={'Hobby': Hobby},
+        )
+
+        assert [node.name for node in nodes] == ['Pottery', 'Painting']
+        pottery = next(node for node in nodes if node.name == 'Pottery')
+        assert 'Hobby' in pottery.labels
+
+    @pytest.mark.asyncio
+    async def test_keeps_a_person_apart_from_its_generic_homonym(self, monkeypatch):
+        """A Person never collapses by name into another node of the same message."""
+        clients, llm_generate = _make_clients()
+
+        from pydantic import BaseModel
+
         class Person(BaseModel):
             """A human person."""
 
@@ -223,9 +262,11 @@ class TestExtractNodesSmallInput:
             entity_types={'Person': Person},
         )
 
-        assert [node.name for node in nodes] == ['Caroline', 'Melanie']
-        caroline = next(node for node in nodes if node.name == 'Caroline')
-        assert 'Person' in caroline.labels
+        assert [(node.name, set(node.labels)) for node in nodes] == [
+            ('Caroline', {'Entity'}),
+            ('Caroline', {'Entity', 'Person'}),
+            ('Melanie', {'Entity', 'Person'}),
+        ]
 
 
 class TestExtractNodesPromptSelection:
