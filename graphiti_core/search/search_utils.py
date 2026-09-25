@@ -1768,7 +1768,7 @@ async def get_edge_invalidation_candidates(
                 """
                                                                                                                                         UNWIND $edges AS edge
                                                                                                                                         MATCH (n:Entity)-[e:RELATES_TO {group_id: edge.group_id}]->(m:Entity)
-                                                                                                                                        WHERE n.uuid IN [edge.source_node_uuid, edge.target_node_uuid] OR m.uuid IN [edge.target_node_uuid, edge.source_node_uuid]
+                                                                                                                                        WHERE (n.uuid IN [edge.source_node_uuid, edge.target_node_uuid] OR m.uuid IN [edge.target_node_uuid, edge.source_node_uuid])
                                                                                                                                         """
                 + filter_query
                 + """
