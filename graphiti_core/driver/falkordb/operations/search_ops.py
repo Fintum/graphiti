@@ -121,9 +121,14 @@ def _build_falkor_fulltext_query(
 
     sanitized_query = _sanitize(query)
 
-    # Remove stopwords and empty tokens
+    # Remove stopwords and tokens without a letter or digit: a lone '_' (from text such as
+    # "CAMPAÑA _ FASE") is a RediSearch syntax error, and such a token matches nothing anyway.
     query_words = sanitized_query.split()
-    filtered_words = [word for word in query_words if word and word.lower() not in STOPWORDS]
+    filtered_words = [
+        word
+        for word in query_words
+        if any(char.isalnum() for char in word) and word.lower() not in STOPWORDS
+    ]
     sanitized_query = ' | '.join(filtered_words)
 
     if len(sanitized_query.split(' ')) + len(group_ids or '') >= max_query_length:

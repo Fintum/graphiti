@@ -604,9 +604,14 @@ class FalkorDriver(GraphDriver):
 
         sanitized_query = self.sanitize(query)
 
-        # Remove stopwords and empty tokens from the sanitized query
+        # Remove stopwords and tokens without a letter or digit: a lone '_' (from text such as
+        # "CAMPAÑA _ FASE") is a RediSearch syntax error, and such a token matches nothing anyway.
         query_words = sanitized_query.split()
-        filtered_words = [word for word in query_words if word and word.lower() not in STOPWORDS]
+        filtered_words = [
+            word
+            for word in query_words
+            if any(char.isalnum() for char in word) and word.lower() not in STOPWORDS
+        ]
         sanitized_query = ' | '.join(filtered_words)
 
         # If the query is too long return no query

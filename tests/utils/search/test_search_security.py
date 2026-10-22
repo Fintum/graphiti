@@ -109,3 +109,30 @@ def test_falkordb_fulltext_query_escapes_default_group_id():
     built = _build_falkor_fulltext_query('hello', [default])
     assert '@group_id:"\\_"' in built
     assert '@group_id:"_"' not in built
+
+
+FAILED_IN_PRODUCTION = (
+    'Camino al Cambio utiliza estructura nomenclatura CAMPAÑA _ FASE _ AD _ VERSIÓN '
+    'ejemplificada ECD_EG_AD01_V1 anuncio Evergreen'
+)
+EXPECTED_TERMS = (
+    '(Camino | Cambio | utiliza | estructura | nomenclatura | CAMPAÑA | FASE | AD | VERSIÓN | '
+    'ejemplificada | ECD_EG_AD01_V1 | anuncio | Evergreen)'
+)
+
+
+def test_falkordb_fulltext_query_drops_terms_without_a_letter_or_digit():
+    # A lone '_' is a RediSearch syntax error ("Syntax error at offset 122 near CAMPAÑA").
+    built = _build_falkor_fulltext_query(FAILED_IN_PRODUCTION + ' __ –', ['org_1'])
+    assert built.endswith(' ' + EXPECTED_TERMS)
+    assert '| _ |' not in built
+
+
+def test_falkordb_driver_fulltext_query_drops_terms_without_a_letter_or_digit():
+    from graphiti_core.driver.falkordb_driver import FalkorDriver
+
+    driver = MagicMock(spec=FalkorDriver)
+    driver.sanitize.side_effect = lambda query: FalkorDriver.sanitize(driver, query)
+
+    built = FalkorDriver.build_fulltext_query(driver, FAILED_IN_PRODUCTION + ' __ –', ['org_1'])
+    assert built.endswith(' ' + EXPECTED_TERMS)
