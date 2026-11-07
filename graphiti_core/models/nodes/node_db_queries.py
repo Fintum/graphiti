@@ -20,6 +20,8 @@ from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.helpers import validate_node_labels
 from graphiti_core.utils.protected_persistence import preserving_update
 
+MAX_NODES_PER_QUERY = 20
+
 
 def _validate_entity_labels(labels: str | list[str]) -> list[str]:
     resolved_labels = labels.split(':') if isinstance(labels, str) else labels
@@ -200,24 +202,7 @@ def get_entity_node_save_bulk_query(
 
     match provider:
         case GraphProvider.FALKORDB:
-            queries = []
-            for node in nodes:
-                for label in node['labels']:
-                    queries.append(
-                        (
-                            f"""
-                            UNWIND $nodes AS node
-                            MERGE (n:Entity {{uuid: node.uuid}})
-                            SET n:{label}
-                            {preserving_update('n', 'node', 'node')}
-                            WITH n, node
-                            SET n.name_embedding = vecf32(node.name_embedding)
-                            RETURN n.uuid AS uuid
-                            """,
-                            {'nodes': [node]},
-                        )
-                    )
-            return queries
+            return _falkordb_entity_node_bulk_queries(nodes)
         case GraphProvider.NEPTUNE:
             queries = []
             for node in nodes:
@@ -266,6 +251,46 @@ def get_entity_node_save_bulk_query(
                 RETURN n.uuid AS uuid
             """
             )
+
+
+def _falkordb_entity_node_bulk_queries(nodes: list[dict]) -> list[tuple[str, dict[str, Any]]]:
+    """One query per label set, repetition of a uuid and tranche of MAX_NODES_PER_QUERY nodes.
+
+    FalkorDB takes no label as a parameter, so the labels are literal and a query only
+    carries nodes that share them. A MERGE inside an UNWIND has no defined result for
+    two rows with the same uuid, so the k-th copy of a uuid goes in the k-th round of
+    queries and is written over the previous copies, as when each node had its own query.
+    The tranches bound how long a single write holds the graph.
+    """
+    rounds: list[dict[tuple[str, ...], list[dict]]] = []
+    copies: dict[Any, int] = {}
+    for node in nodes:
+        labels = tuple(sorted(set(_validate_entity_labels(node['labels']))))
+        if not labels:
+            continue
+        copy = copies.get(node.get('uuid'), 0)
+        copies[node.get('uuid')] = copy + 1
+        if copy == len(rounds):
+            rounds.append({})
+        rounds[copy].setdefault(labels, []).append(node)
+    return [
+        (_falkordb_entity_node_bulk_query(labels), {'nodes': group[start : start + MAX_NODES_PER_QUERY]})
+        for groups in rounds
+        for labels, group in groups.items()
+        for start in range(0, len(group), MAX_NODES_PER_QUERY)
+    ]
+
+
+def _falkordb_entity_node_bulk_query(labels: tuple[str, ...]) -> str:
+    return f"""
+        UNWIND $nodes AS node
+        MERGE (n:Entity {{uuid: node.uuid}})
+        SET n:{':'.join(labels)}
+        {preserving_update('n', 'node', 'node')}
+        WITH n, node
+        SET n.name_embedding = vecf32(node.name_embedding)
+        RETURN n.uuid AS uuid
+    """
 
 
 def get_entity_node_return_query(provider: GraphProvider) -> str:
