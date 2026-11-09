@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from functools import lru_cache
 from hashlib import blake2b
 from typing import TYPE_CHECKING
@@ -42,9 +44,21 @@ _MINHASH_BAND_SIZE = 4
 
 
 def _normalize_string_exact(name: str) -> str:
-    """Lowercase text and collapse whitespace so equal names map to the same key."""
-    normalized = re.sub(r'[\s]+', ' ', name.lower())
-    return normalized.strip()
+    """Lowercase, drop Latin accents and collapse whitespace so equal names map to one key."""
+    return re.sub(r'[\s]+', ' ', _without_latin_marks(name.lower())).strip()
+
+
+def _without_latin_marks(text: str) -> str:
+    """Drop the marks on Latin letters; other scripts keep theirs, which tell letters apart."""
+    kept: list[str] = []
+    on_latin = False
+    for char in unicodedata.normalize('NFKD', text):
+        if not unicodedata.combining(char):
+            on_latin = unicodedata.name(char, '').startswith('LATIN')
+        elif on_latin:
+            continue
+        kept.append(char)
+    return unicodedata.normalize('NFC', ''.join(kept))
 
 
 def _normalize_name_for_fuzzy(name: str) -> str:
@@ -194,6 +208,29 @@ def _promote_resolved_node(
     return resolved_node
 
 
+def by_age(node: EntityNode) -> tuple[datetime, str]:
+    """Order nodes from the oldest, a naive date read as UTC, and by uuid when two share a date."""
+    created_at = node.created_at
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    return created_at, node.uuid
+
+
+def oldest_copy(copies: Sequence[EntityNode]) -> EntityNode | None:
+    """The oldest of copies sharing one normalized name and type; None if none or they differ."""
+    if not copies:
+        return None
+    first = copies[0]
+    name, kind = _normalize_string_exact(first.name), _kind(first)
+    if any(_normalize_string_exact(copy.name) != name or _kind(copy) != kind for copy in copies):
+        return None
+    return min(copies, key=by_age)
+
+
+def _kind(node: EntityNode) -> frozenset[str]:
+    return frozenset(node.labels) - {'Entity'}
+
+
 def _build_candidate_indexes(existing_nodes: list[EntityNode]) -> DedupCandidateIndexes:
     """Precompute exact and fuzzy lookup structures once per dedupe run."""
     normalized_existing: defaultdict[str, list[EntityNode]] = defaultdict(list)
@@ -237,16 +274,20 @@ def _resolve_with_similarity(
         normalized_exact = _normalize_string_exact(node.name)
         normalized_fuzzy = _normalize_name_for_fuzzy(node.name)
 
-        existing_matches = [candidate for candidate in indexes.normalized_existing.get(normalized_exact, [])
-                            if identities_compatible(node, candidate)]
-        if len(existing_matches) == 1:
-            match = _promote_resolved_node(node, existing_matches[0])
+        existing_matches = [
+            candidate
+            for candidate in indexes.normalized_existing.get(normalized_exact, [])
+            if identities_compatible(node, candidate)
+        ]
+        oldest = oldest_copy(existing_matches)
+        if oldest is not None:
+            match = _promote_resolved_node(node, oldest)
             state.resolved_nodes[idx] = match
             state.uuid_map[node.uuid] = match.uuid
             if match.uuid != node.uuid:
                 state.duplicate_pairs.append((node, match))
             continue
-        if len(existing_matches) > 1:
+        if existing_matches:
             state.unresolved_indices.append(idx)
             continue
 
@@ -263,13 +304,19 @@ def _resolve_with_similarity(
         best_candidate: EntityNode | None = None
         best_score = 0.0
         for candidate_id in candidate_ids:
-            if not identities_compatible(node, indexes.nodes_by_uuid[candidate_id]):
+            candidate = indexes.nodes_by_uuid[candidate_id]
+            if not identities_compatible(node, candidate):
                 continue
             candidate_shingles = indexes.shingles_by_candidate.get(candidate_id, set())
             score = _jaccard_similarity(shingles, candidate_shingles)
-            if score > best_score:
+            tied_and_older = (
+                score == best_score
+                and best_candidate is not None
+                and by_age(candidate) < by_age(best_candidate)
+            )
+            if score > best_score or tied_and_older:
                 best_score = score
-                best_candidate = indexes.nodes_by_uuid.get(candidate_id)
+                best_candidate = candidate
 
         if best_candidate is not None and best_score >= _FUZZY_JACCARD_THRESHOLD:
             best_candidate = _promote_resolved_node(node, best_candidate)
@@ -296,4 +343,6 @@ __all__ = [
     '_build_candidate_indexes',
     '_promote_resolved_node',
     '_resolve_with_similarity',
+    'by_age',
+    'oldest_copy',
 ]

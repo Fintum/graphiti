@@ -60,6 +60,7 @@ from graphiti_core.utils.maintenance.identity_constraints import (
     protected_attributes,
     require_same_identity,
 )
+from graphiti_core.utils.maintenance.name_copies import admitted_copies, copy_key, crowded, stored_copies
 from graphiti_core.utils.maintenance.resolution_decisions import (
     LlmResolutionDecisions,
     NodeQuestion,
@@ -492,7 +493,11 @@ async def _collect_candidate_nodes(
     existing_nodes_override: list[EntityNode] | None,
     acl: EnrichmentAcl | None = None,
 ) -> list[list[EntityNode]]:
-    """Search per extracted name and return ordered candidates for each extracted node."""
+    """Search per extracted name and return ordered candidates for each extracted node.
+
+    A full page that ends on the node's own name also gets the admitted copies of that name the
+    cut left out, oldest first.
+    """
     from graphiti_core.utils.maintenance.protected_persistence import validate_entity_writes
 
     await validate_entity_writes(clients.driver, extracted_nodes, [])
@@ -500,7 +505,14 @@ async def _collect_candidate_nodes(
     by_uuid = {node.uuid: node for node in stored}
     visible = {node.uuid: node for node in await acl_nodes(acl, stored)}
     unresolved = [node for node in extracted_nodes if node.uuid not in by_uuid]
-    search_results = iter(await _semantic_candidate_search(clients, unresolved))
+    pages = await _semantic_candidate_search(clients, unresolved)
+    crowding = [
+        node
+        for node, page in zip(unresolved, pages, strict=True)
+        if crowded(page, node, NODE_DEDUP_CANDIDATE_LIMIT)
+    ]
+    copies = await stored_copies(clients.driver, crowding)
+    search_results = iter(pages)
     result = []
     for node in extracted_nodes:
         exact = by_uuid.get(node.uuid)
@@ -510,7 +522,19 @@ async def _collect_candidate_nodes(
             candidate.attributes = merge_provenance(candidate.attributes, node.attributes)
             result.append([candidate])
         else:
-            candidates = await acl_nodes(acl, _merge_candidate_nodes(next(search_results), existing_nodes_override))
+            page = _merge_candidate_nodes(next(search_results), existing_nodes_override)
+            offered = {candidate.uuid for candidate in page}
+            candidates = [
+                *await acl_nodes(acl, page),
+                *await admitted_copies(
+                    clients.driver,
+                    acl,
+                    node,
+                    copies.get(copy_key(node), []),
+                    offered,
+                    NODE_DEDUP_CANDIDATE_LIMIT,
+                ),
+            ]
             result.append([candidate for candidate in candidates if identities_compatible(node, candidate)])
     return result
 

@@ -1,5 +1,6 @@
 import logging
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -59,6 +60,20 @@ def _make_episode(group_id: str = 'group'):
         source_description='test',
         content='content',
         valid_at=utc_now(),
+    )
+
+
+FIRST_SEEN = datetime(2026, 1, 5, tzinfo=timezone.utc)
+
+
+def _copy(name: str, days_later: int, labels: list[str] | None = None, uuid: str | None = None) -> EntityNode:
+    extra = {} if uuid is None else {'uuid': uuid}
+    return EntityNode(
+        name=name,
+        group_id='group',
+        labels=labels or ['Entity'],
+        created_at=FIRST_SEEN + timedelta(days=days_later),
+        **extra,
     )
 
 
@@ -276,7 +291,31 @@ async def test_resolve_nodes_semantic_miss_keeps_node_without_llm(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_resolve_nodes_multiple_exact_matches_use_llm(monkeypatch):
+async def test_resolve_nodes_multiple_exact_matches_of_one_type_take_the_oldest_without_llm(monkeypatch):
+    clients, llm_generate = _make_clients()
+    newer, oldest = _copy('Java', 2), _copy('JAVA', 0)
+    extracted = EntityNode(name='Java', group_id='group', labels=['Entity'])
+
+    monkeypatch.setattr(
+        'graphiti_core.utils.maintenance.node_operations._semantic_candidate_search',
+        _semantic_candidates([[newer, oldest]]),
+    )
+
+    resolved, uuid_map, duplicates = await resolve_extracted_nodes(
+        clients,
+        [extracted],
+        episode=_make_episode(),
+        previous_episodes=[],
+    )
+
+    assert resolved[0].uuid == oldest.uuid
+    assert uuid_map[extracted.uuid] == oldest.uuid
+    assert duplicates == [(extracted, oldest)]
+    llm_generate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resolve_nodes_multiple_exact_matches_of_different_types_use_llm(monkeypatch):
     clients, llm_generate = _make_clients()
     llm_generate.return_value = {
         'entity_resolutions': [
@@ -287,8 +326,8 @@ async def test_resolve_nodes_multiple_exact_matches_use_llm(monkeypatch):
             }
         ]
     }
-    candidate1 = EntityNode(name='Java', group_id='group', labels=['Entity'])
-    candidate2 = EntityNode(name='Java', group_id='group', labels=['Entity'])
+    candidate1 = _copy('Java', 1)
+    candidate2 = _copy('Java', 0, ['Entity', 'Topic'])
     extracted = EntityNode(name='Java', group_id='group', labels=['Entity'])
 
     monkeypatch.setattr(
@@ -327,8 +366,8 @@ async def test_resolve_nodes_batches_unresolved_nodes_into_one_llm_call(monkeypa
     }
 
     low_entropy_candidate = EntityNode(name='Joseph', group_id='group', labels=['Entity'])
-    java_candidate_1 = EntityNode(name='Java', group_id='group', labels=['Entity'])
-    java_candidate_2 = EntityNode(name='Java', group_id='group', labels=['Entity'])
+    java_candidate_1 = _copy('Java', 1)
+    java_candidate_2 = _copy('Java', 0, ['Entity', 'Topic'])
     extracted_nodes = [
         EntityNode(name='Joe', group_id='group', labels=['Entity']),
         EntityNode(name='Java', group_id='group', labels=['Entity']),
@@ -368,6 +407,50 @@ def test_build_candidate_indexes_populates_structures():
 def test_normalize_helpers():
     assert _normalize_string_exact('  Alice   Smith ') == 'alice smith'
     assert _normalize_name_for_fuzzy('Alice-Smith!') == 'alice smith'
+
+
+def test_normalize_helpers_fold_accents():
+    assert _normalize_string_exact('TRANSFÓRMATE  la Vida') == 'transformate la vida'
+    assert _normalize_string_exact('Transformate la Vida') == _normalize_string_exact('Transfórmate la Vida')
+    assert _normalize_name_for_fuzzy('Transfórmate-la-Vida, S.L.') == 'transformate la vida s l'
+
+
+@pytest.mark.parametrize(
+    ('first', 'second'),
+    [
+        pytest.param('Peña Hermanos', 'Pena Hermanos', id='latin-tilde'),
+        pytest.param('Müller GmbH', 'MULLER gmbh', id='latin-umlaut'),
+        pytest.param('İstanbul Ltd', 'istanbul ltd', id='latin-dotted-capital-i'),
+        pytest.param('ﾊﾟﾝ工房', 'パン工房', id='halfwidth-katakana'),
+    ],
+)
+def test_normalize_exact_folds_latin_marks_and_compatibility_forms(first, second):
+    assert _normalize_string_exact(first) == _normalize_string_exact(second)
+
+
+@pytest.mark.parametrize(
+    ('first', 'second'),
+    [
+        pytest.param('Мой банк', 'Мои банк', id='cyrillic-short-i'),
+        pytest.param('パン工房', 'ハン工房', id='katakana-handakuten'),
+        pytest.param('がっこう', 'かっこう', id='hiragana-dakuten'),
+        pytest.param('ไม่', 'ไม', id='thai-tone'),
+        pytest.param('क्षमा', 'कषमा', id='devanagari-virama'),
+    ],
+)
+def test_normalize_exact_keeps_the_marks_that_tell_letters_apart_outside_latin(first, second):
+    assert _normalize_string_exact(first) != _normalize_string_exact(second)
+
+
+def test_resolve_with_similarity_accent_variant_is_an_exact_match():
+    candidate = EntityNode(name='Transfórmate la Vida', group_id='group', labels=['Entity', 'Company'])
+    extracted = EntityNode(name='Transformate la Vida', group_id='group', labels=['Entity', 'Company'])
+    state = DedupResolutionState(resolved_nodes=[None], uuid_map={}, unresolved_indices=[])
+
+    _resolve_with_similarity([extracted], _build_candidate_indexes([candidate]), state)
+
+    assert state.resolved_nodes[0] is candidate
+    assert state.unresolved_indices == []
 
 
 def test_name_entropy_variants():
@@ -452,10 +535,10 @@ def test_resolve_with_similarity_short_name_no_candidate_defers_to_llm():
     assert state.duplicate_pairs == []
 
 
-def test_resolve_with_similarity_short_name_multiple_candidates_defers_to_llm():
-    """Short names with multiple exact matches should escalate to LLM."""
-    candidate1 = EntityNode(name='Java', group_id='group', labels=['Entity'])
-    candidate2 = EntityNode(name='Java', group_id='group', labels=['Entity'])
+def test_resolve_with_similarity_short_name_multiple_candidates_of_different_types_defers_to_llm():
+    """Short names with exact matches of several types should escalate to LLM."""
+    candidate1 = _copy('Java', 0)
+    candidate2 = _copy('Java', 1, ['Entity', 'Topic'])
     extracted = EntityNode(name='Java', group_id='group', labels=['Entity'])
 
     indexes = _build_candidate_indexes([candidate1, candidate2])
@@ -487,9 +570,9 @@ def test_resolve_with_similarity_low_entropy_defers_resolution():
     assert state.duplicate_pairs == []
 
 
-def test_resolve_with_similarity_multiple_exact_matches_defers_to_llm():
-    candidate1 = EntityNode(name='Johnny Appleseed', group_id='group', labels=['Entity'])
-    candidate2 = EntityNode(name='Johnny Appleseed', group_id='group', labels=['Entity'])
+def test_resolve_with_similarity_multiple_exact_matches_of_different_types_defers_to_llm():
+    candidate1 = _copy('Johnny Appleseed', 0, ['Entity', 'Organization'])
+    candidate2 = _copy('Johnny Appleseed', 1, ['Entity', 'Topic'])
     extracted = EntityNode(name='Johnny Appleseed', group_id='group', labels=['Entity'])
 
     indexes = _build_candidate_indexes([candidate1, candidate2])
@@ -500,6 +583,40 @@ def test_resolve_with_similarity_multiple_exact_matches_defers_to_llm():
     assert state.resolved_nodes[0] is None
     assert state.unresolved_indices == [0]
     assert state.duplicate_pairs == []
+
+
+@pytest.mark.parametrize('order', ['newest-first', 'oldest-first'])
+def test_resolve_with_similarity_multiple_exact_matches_of_one_type_take_the_oldest(order):
+    oldest, newer, newest = _copy('Johnny Appleseed', 0), _copy('johnny  appleseed', 3), _copy('Jóhnny Appleseed', 5)
+    copies = [newest, newer, oldest] if order == 'newest-first' else [oldest, newer, newest]
+    extracted = EntityNode(name='Johnny Appleseed', group_id='group', labels=['Entity'])
+    state = DedupResolutionState(resolved_nodes=[None], uuid_map={}, unresolved_indices=[])
+
+    _resolve_with_similarity([extracted], _build_candidate_indexes(copies), state)
+
+    assert state.resolved_nodes[0] is oldest
+    assert state.uuid_map == {extracted.uuid: oldest.uuid}
+    assert state.unresolved_indices == []
+
+
+def test_resolve_with_similarity_copies_created_together_tie_on_the_uuid():
+    first, second = _copy('Johnny Appleseed', 0, uuid='b-copy'), _copy('Johnny Appleseed', 0, uuid='a-copy')
+    extracted = EntityNode(name='Johnny Appleseed', group_id='group', labels=['Entity'])
+    state = DedupResolutionState(resolved_nodes=[None], uuid_map={}, unresolved_indices=[])
+
+    _resolve_with_similarity([extracted], _build_candidate_indexes([first, second]), state)
+
+    assert state.resolved_nodes[0] is second
+
+
+def test_resolve_with_similarity_fuzzy_ties_take_the_oldest():
+    newer, oldest = _copy('Johnny Appleseed Farms', 4), _copy('Johnny Appleseed Farms', 1, ['Entity', 'Topic'])
+    extracted = EntityNode(name='Johnny Appleseed Farms!', group_id='group', labels=['Entity'])
+    state = DedupResolutionState(resolved_nodes=[None], uuid_map={}, unresolved_indices=[])
+
+    _resolve_with_similarity([extracted], _build_candidate_indexes([newer, oldest]), state)
+
+    assert state.resolved_nodes[0] is oldest
 
 
 @pytest.mark.asyncio
