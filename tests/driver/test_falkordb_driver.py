@@ -794,7 +794,8 @@ class TestFalkorDriverIndexLifecycle:
     def test_describe_index_query_names_the_index(self):
         assert describe_index_query(INDEX_QUERIES[0]) == 'index on Entity'
         assert describe_index_query(RELATES_TO_FULLTEXT_QUERY) == 'fulltext index on RELATES_TO'
-        assert describe_index_query(INDEX_QUERIES[9]) == 'fulltext index on Episodic'
+        first_fulltext = INDEX_QUERIES[len(get_range_indices(GraphProvider.FALKORDB))]
+        assert describe_index_query(first_fulltext) == 'fulltext index on Episodic'
 
 
 # Simple integration test

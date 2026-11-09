@@ -32,6 +32,32 @@ if TYPE_CHECKING:
     from graphiti_core.edges import EntityEdge
     from graphiti_core.nodes import EntityNode
 
+# Every label and edge type graphiti writes, each with a uuid range index in get_range_indices.
+STORED_NODE_LABELS = ('Entity', 'Episodic', 'Community', 'Saga')
+STORED_EDGE_TYPES = ('RELATES_TO', 'MENTIONS', 'HAS_MEMBER', 'HAS_EPISODE', 'NEXT_EPISODE')
+
+
+def _stored_nodes_query() -> str:
+    branches = ' UNION ALL '.join(
+        f'MATCH (n:{label}) WHERE n.uuid IN $uuids'
+        + ''.join(f' AND NOT n:{earlier}' for earlier in STORED_NODE_LABELS[:position])
+        + ' RETURN n'
+        for position, label in enumerate(STORED_NODE_LABELS)
+    )
+    return f'CALL {{ {branches} }} RETURN properties(n) AS properties, labels(n) AS labels ORDER BY id(n)'
+
+
+def _stored_edges_query() -> str:
+    branches = ' UNION ALL '.join(
+        f'MATCH (s)-[e:{kind}]->(t) WHERE e.uuid IN $uuids RETURN e, s, t'
+        for kind in STORED_EDGE_TYPES
+    )
+    return f'CALL {{ {branches} }} RETURN properties(e) AS properties, s.uuid AS source, t.uuid AS target'
+
+
+STORED_NODES = _stored_nodes_query()
+STORED_EDGES = _stored_edges_query()
+
 
 def preserving_update(variable: str, payload: str, carry: str = '') -> str:
     variables = f'{variable}, {carry}' if carry else variable
@@ -82,10 +108,7 @@ async def validate_entity_writes(
             require_same_identity(node, by_uuid[node.uuid])
         by_uuid[node.uuid] = node
     if by_uuid:
-        rows = (await driver.execute_query(
-            'MATCH (n) WHERE n.uuid IN $uuids RETURN properties(n) AS properties, labels(n) AS labels',
-            uuids=list(by_uuid),
-        ))[0]
+        rows = (await driver.execute_query(STORED_NODES, uuids=list(by_uuid)))[0]
         seen: set[str] = set()
         for row in rows:
             properties = row['properties']
@@ -124,11 +147,7 @@ async def validate_entity_writes(
             if other is not None and not scopes_compatible(other.attributes, edge.attributes):
                 raise IdentityConflict('incompatible_edge_scope')
             incoming_edges[edge.uuid] = edge
-        rows = (await driver.execute_query(
-            'MATCH (s)-[e]->(t) WHERE e.uuid IN $uuids '
-            'RETURN properties(e) AS properties, s.uuid AS source, t.uuid AS target',
-            uuids=[edge.uuid for edge in edges],
-        ))[0]
+        rows = (await driver.execute_query(STORED_EDGES, uuids=[edge.uuid for edge in edges]))[0]
         stored_edges = {row['properties']['uuid']: row for row in rows}
         if len(stored_edges) != len(rows):
             raise IdentityConflict('duplicate_stored_edge_uuid')

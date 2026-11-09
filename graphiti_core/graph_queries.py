@@ -38,6 +38,8 @@ def get_range_indices(provider: GraphProvider) -> list[LiteralString]:
             'CREATE INDEX FOR (n:Saga) ON (n.uuid, n.group_id, n.name)',
             # RELATES_TO edge
             'CREATE INDEX FOR ()-[e:RELATES_TO]-() ON (e.uuid, e.group_id, e.name, e.created_at, e.expired_at, e.valid_at, e.invalid_at)',
+            # RELATES_TO episodes, apart: FalkorDB rejects a whole CREATE INDEX naming an already indexed field
+            'CREATE INDEX FOR ()-[e:RELATES_TO]-() ON (e.episodes)',
             # MENTIONS edge
             'CREATE INDEX FOR ()-[e:MENTIONS]-() ON (e.uuid, e.group_id)',
             # HAS_MEMBER edge
