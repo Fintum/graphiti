@@ -13,15 +13,12 @@ from graphiti_core.utils.protected_persistence import (
     STORED_EDGE_TYPES,
     STORED_NODE_LABELS,
     preserving_update,
+    unioned,
 )
 
 
 def union(variable: str, key: str) -> str:
-    prior, current = f'authority.{key}', f'{variable}.{key}'
-    return (
-        f'{current} = CASE WHEN {prior} IS NULL THEN {current} WHEN {current} IS NULL THEN {prior} '
-        f'ELSE {prior} + [item IN {current} WHERE NOT item IN {prior}] END'
-    )
+    return f'{variable}.{key} = {unioned(key, f"{variable}.{key}")}'
 
 
 def test_rewriting_an_edge_keeps_every_episode_that_invalidated_it():

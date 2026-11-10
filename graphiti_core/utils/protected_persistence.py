@@ -59,23 +59,40 @@ STORED_NODES = _stored_nodes_query()
 STORED_EDGES = _stored_edges_query()
 
 
+UNIONED_FIELDS = frozenset({'provenance', 'evidence_refs', 'episodes', 'invalidated_by'})
+
+
+def unioned(key: str, current: str) -> str:
+    """The stored list, then what the payload adds that it lacks, scanning only the payload past the stored list.
+
+    A hub's list runs to tens of thousands of episodes and a write holds the whole server, so no step may cost
+    their square: `prior_<key>` is bound before the SET because reading `authority.<key>` inside the comprehension
+    copies the list on every item, and FalkorDB evaluates every branch of a CASE, so the only branch is the cut.
+    The payload is the stored list in its order plus what is new (merge_provenance): the scan starts past it when
+    the payload starts with it, and at the start otherwise, which keeps the full check for any other payload.
+    """
+    stored, given = f'prior_{key}', f'coalesce({current}, [])'
+    cut = f'CASE WHEN {given}[0..size({stored})] = {stored} THEN size({stored}) ELSE 0 END'
+    return (f'CASE WHEN authority.{key} IS NULL AND {current} IS NULL THEN null '
+            f'ELSE {stored} + [item IN {given}[{cut}..size({given})] WHERE NOT item IN {stored}] END')
+
+
 def preserving_update(variable: str, payload: str, carry: str = '') -> str:
     variables = f'{variable}, {carry}' if carry else variable
     assignments = []
     fields = PROTECTED_ATTRIBUTES | ({'episodes', 'invalidated_by'} if variable != 'n' else set())
+    lists = sorted(fields & UNIONED_FIELDS)
     for key in sorted(fields):
         prior, current = f'authority.{key}', f'{variable}.{key}'
-        value = f'coalesce({prior}, {current})'
-        if key in {'provenance', 'evidence_refs', 'episodes', 'invalidated_by'}:
-            value = (f'CASE WHEN {prior} IS NULL THEN {current} WHEN {current} IS NULL THEN {prior} '
-                     f'ELSE {prior} + [item IN {current} WHERE NOT item IN {prior}] END')
+        value = unioned(key, current) if key in UNIONED_FIELDS else f'coalesce({prior}, {current})'
         assignments.append(f'{current} = {value}')
     if variable == 'n':
         assignments.append(
             'n.name = CASE WHEN authority.user_id IS NOT NULL OR authority.directory = true '
             'THEN coalesce(authority.name, n.name) ELSE n.name END'
         )
-    return (f'WITH {variables}, properties({variable}) AS authority '
+    priors = ''.join(f', coalesce(authority.{key}, []) AS prior_{key}' for key in lists)
+    return (f'WITH {variables}, properties({variable}) AS authority WITH {variables}, authority{priors} '
             f'SET {variable} = {payload} SET ' + ', '.join(assignments))
 
 
