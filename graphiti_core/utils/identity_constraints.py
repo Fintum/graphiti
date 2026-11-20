@@ -23,7 +23,8 @@ if TYPE_CHECKING:
 
 IDENTITY_FIELDS = frozenset({'user_id', 'task_id', 'document_id', 'organization_id', 'identity_key'})
 SCOPE_FIELDS = frozenset({'org_public', 'directory', 'owner_user_id', 'acl_key'})
-PROTECTED_ATTRIBUTES = IDENTITY_FIELDS | SCOPE_FIELDS | frozenset({
+DISCARD_FIELDS = frozenset({'discarded_at', 'discarded_by', 'discarded_episodes'})
+PROTECTED_ATTRIBUTES = IDENTITY_FIELDS | SCOPE_FIELDS | DISCARD_FIELDS | frozenset({
     'provenance', 'source_key', 'revision_id', 'evidence_refs', 'policy_version',
     'last_activity_at', 'deleted_at',
 })
@@ -94,8 +95,22 @@ def scopes_compatible(left: dict[str, Any], right: dict[str, Any]) -> bool:
                == right.get(key, False if key in {'org_public', 'directory'} else None) for key in SCOPE_FIELDS)
 
 
+def share_declared_audience(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """Both declare one audience: an edge sealed with its acl_key does, a node known by the episodes citing it does not."""
+    return left.get('acl_key') is not None and scopes_compatible(left, right)
+
+
+def absorb_discard(prior: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    """The prior attributes with the discard mark of what they absorb, when they have none and declare its audience."""
+    if prior.get('discarded_at') is not None or incoming.get('discarded_at') is None:
+        return dict(prior)
+    if not share_declared_audience(prior, incoming):
+        return dict(prior)
+    return {**prior, **{key: incoming[key] for key in DISCARD_FIELDS if key in incoming}}
+
+
 def merge_provenance(prior: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
-    merged = dict(prior)
+    merged = absorb_discard(prior, incoming)
     for key in ('provenance', 'evidence_refs'):
         previous, current = prior.get(key, []), incoming.get(key, [])
         if isinstance(previous, list) and isinstance(current, list) and (previous or current):

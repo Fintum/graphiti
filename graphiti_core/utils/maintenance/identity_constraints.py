@@ -21,6 +21,7 @@ from graphiti_core.utils.identity_constraints import (
     SCOPE_FIELDS as SCOPE_FIELDS,
     STRUCTURAL_ATTRIBUTES as STRUCTURAL_ATTRIBUTES,
     IdentityConflict as IdentityConflict,
+    absorb_discard as absorb_discard,
     identities_compatible as identities_compatible,
     inferred_attributes as inferred_attributes,
     merge_provenance as merge_provenance,

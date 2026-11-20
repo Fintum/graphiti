@@ -8,13 +8,28 @@ from graphiti_core.models.edges.edge_db_queries import (
     get_entity_edge_save_bulk_query,
     get_entity_edge_save_query,
 )
-from graphiti_core.models.nodes.node_db_queries import get_entity_node_save_query
+from graphiti_core.models.nodes.node_db_queries import (
+    _falkordb_entity_node_bulk_query,
+    get_entity_node_save_query,
+)
+from graphiti_core.utils.identity_constraints import (
+    inferred_attributes,
+    preserve_authority,
+    prompt_attributes,
+)
 from graphiti_core.utils.protected_persistence import (
     STORED_EDGE_TYPES,
     STORED_NODE_LABELS,
     preserving_update,
     unioned,
 )
+
+DISCARD_MARK = {
+    'discarded_at': '2026-11-19T10:00:00+00:00',
+    'discarded_by': 'suppression-1',
+    'discarded_episodes': ['episode-of-sales'],
+}
+FORGED_MARK = {'discarded_at': None, 'discarded_by': 'llm', 'discarded_episodes': ['forged']}
 
 
 def union(variable: str, key: str) -> str:
@@ -53,3 +68,31 @@ def test_relates_to_episodes_is_indexed_on_its_own_statement():
     assert 'CREATE INDEX FOR ()-[e:RELATES_TO]-() ON (e.episodes)' in get_range_indices(
         GraphProvider.FALKORDB
     )
+
+
+def test_the_llm_neither_sees_nor_sets_a_discard_mark():
+    attributes = {**DISCARD_MARK, 'title': 'CEO'}
+
+    assert inferred_attributes(attributes) == {'title': 'CEO'}
+    assert prompt_attributes(attributes) == {'title': 'CEO'}
+
+
+def test_new_attributes_keep_the_stored_discard_mark_whatever_the_answer_says():
+    assert preserve_authority(DISCARD_MARK, {'title': 'CEO'}) == {**DISCARD_MARK, 'title': 'CEO'}
+    assert preserve_authority(DISCARD_MARK, {'title': 'CEO', **FORGED_MARK}) == {
+        **DISCARD_MARK,
+        'title': 'CEO',
+    }
+
+
+def test_every_entity_rewrite_keeps_the_stored_discard_mark():
+    rewrites = [
+        ('e', get_entity_edge_save_query(GraphProvider.FALKORDB)),
+        ('r', get_entity_edge_save_bulk_query(GraphProvider.FALKORDB)),
+        ('n', get_entity_node_save_query(GraphProvider.FALKORDB, labels='Entity')),
+        ('n', _falkordb_entity_node_bulk_query(('Entity',))),
+    ]
+
+    for variable, rewrite in rewrites:
+        for key in DISCARD_MARK:
+            assert f'{variable}.{key} = coalesce(authority.{key}, {variable}.{key})' in rewrite

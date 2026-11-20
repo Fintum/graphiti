@@ -1028,10 +1028,22 @@ def _merge_edge_attributes(
     )
 
 
+def _discarded(edge: EntityEdge) -> bool:
+    """A curator discarded the edge: it stays to absorb its restatements, but settles no validity."""
+    return edge.attributes.get('discarded_at') is not None
+
+
 def _settle_edge_validity(
     resolved_edge: EntityEdge, invalidation_candidates: list[EntityEdge]
 ) -> list[EntityEdge]:
-    """Expire the resolved edge if a contradicted edge is more recent; return the edges it invalidates."""
+    """Expire the resolved edge if a kept contradiction is more recent; return the edges it invalidates.
+
+    A discarded resolved edge neither expires nor invalidates, and a discarded candidate never expires
+    the resolved edge, though the resolved edge may still invalidate it.
+    """
+    if _discarded(resolved_edge):
+        return []
+
     now = utc_now()
 
     if resolved_edge.invalid_at and not resolved_edge.expired_at:
@@ -1044,7 +1056,8 @@ def _settle_edge_validity(
             candidate_valid_at_utc = ensure_utc(candidate.valid_at)
             resolved_edge_valid_at_utc = ensure_utc(resolved_edge.valid_at)
             if (
-                candidate_valid_at_utc is not None
+                not _discarded(candidate)
+                and candidate_valid_at_utc is not None
                 and resolved_edge_valid_at_utc is not None
                 and candidate_valid_at_utc > resolved_edge_valid_at_utc
             ):

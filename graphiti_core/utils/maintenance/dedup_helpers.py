@@ -28,6 +28,7 @@ from hashlib import blake2b
 from typing import TYPE_CHECKING
 
 from graphiti_core.utils.maintenance.identity_constraints import (
+    absorb_discard,
     identities_compatible,
     require_same_identity,
 )
@@ -190,7 +191,8 @@ def _promote_resolved_node(
     extracted_node: EntityNode,
     resolved_node: EntityNode,
 ) -> EntityNode:
-    """Upgrade a generic canonical node when a duplicate carries a specific type."""
+    """Give the canonical node the duplicate's discard mark, and its specific type if the node is generic."""
+    resolved_node.attributes = absorb_discard(resolved_node.attributes, extracted_node.attributes)
     resolved_specific_labels = [label for label in resolved_node.labels if label != 'Entity']
     if resolved_specific_labels:
         return resolved_node

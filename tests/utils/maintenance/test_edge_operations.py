@@ -9,7 +9,10 @@ from graphiti_core.edges import EntityEdge
 from graphiti_core.nodes import EntityNode, EpisodicNode
 from graphiti_core.search.search_config import SearchResults
 from graphiti_core.search.search_filters import SearchFilters
+from graphiti_core.utils.identity_constraints import merge_provenance
+from graphiti_core.utils.maintenance import edge_operations
 from graphiti_core.utils.maintenance.edge_operations import (
+    _settle_edge_validity,
     extract_edges,
     resolve_extracted_edge,
     resolve_extracted_edges,
@@ -1001,3 +1004,158 @@ async def test_resolve_extracted_edges_pairs_each_result_with_its_own_edge(monke
         call.kwargs['search_filter'].edge_uuids for call in search_spy.await_args_list
     ]
     assert [] not in edge_uuid_filters
+
+
+EARLIER = datetime(2025, 1, 1, tzinfo=timezone.utc)
+MIDDLE = datetime(2025, 3, 1, tzinfo=timezone.utc)
+LATER = datetime(2025, 6, 1, tzinfo=timezone.utc)
+NOW = datetime(2026, 3, 1, tzinfo=timezone.utc)
+DISCARD_MARK = {
+    'discarded_at': '2026-11-19T10:00:00+00:00',
+    'discarded_by': 'suppression-1',
+    'discarded_episodes': ['episode-of-sales'],
+}
+OTHER_MARK = {
+    'discarded_at': '2026-11-20T09:00:00+00:00',
+    'discarded_by': 'suppression-2',
+    'discarded_episodes': ['episode-of-sales', 'another-episode'],
+}
+SALES = {'org_public': True, 'directory': False, 'acl_key': 'slack:sales'}
+BOARD = {'org_public': True, 'directory': False, 'acl_key': 'slack:board'}
+
+
+def _price(fact: str, valid_at: datetime, **attributes: object) -> EntityEdge:
+    return EntityEdge(
+        source_node_uuid='plan',
+        target_node_uuid='price',
+        name='COSTS',
+        group_id='group_1',
+        fact=fact,
+        episodes=['episode_1'],
+        created_at=EARLIER,
+        valid_at=valid_at,
+        invalid_at=None,
+        attributes=dict(attributes),
+    )
+
+
+def _validity(edge: EntityEdge) -> tuple:
+    return edge.invalid_at, edge.expired_at, edge.attributes.get('invalidated_by')
+
+
+def _mark(edge: EntityEdge) -> dict:
+    return {key: edge.attributes.get(key) for key in DISCARD_MARK}
+
+
+def test_a_discarded_restatement_invalidates_no_older_visible_edge():
+    discarded = _price('The plan costs 99 €', LATER, **DISCARD_MARK)
+    visible = _price('The plan costs 49 €', EARLIER)
+
+    assert _settle_edge_validity(discarded, [visible]) == []
+    assert _validity(visible) == (None, None, None)
+
+
+def test_a_discarded_restatement_is_not_expired_by_a_newer_visible_edge():
+    discarded = _price('The plan costs 99 €', EARLIER, **DISCARD_MARK)
+    visible = _price('The plan costs 49 €', LATER)
+
+    assert _settle_edge_validity(discarded, [visible]) == []
+    assert _validity(discarded) == (None, None, None)
+    assert _validity(visible) == (None, None, None)
+
+
+def test_a_newer_discarded_edge_never_expires_the_new_edge():
+    new = _price('The plan costs 49 €', EARLIER)
+    discarded = _price('The plan costs 99 €', LATER, **DISCARD_MARK)
+
+    assert _settle_edge_validity(new, [discarded]) == []
+    assert _validity(new) == (None, None, None)
+
+
+def test_a_newer_visible_edge_still_expires_the_new_edge_past_a_discarded_one(monkeypatch):
+    monkeypatch.setattr(edge_operations, 'utc_now', lambda: NOW)
+    new = _price('The plan costs 49 €', EARLIER)
+    discarded = _price('The plan costs 99 €', MIDDLE, **DISCARD_MARK)
+    visible = _price('The plan costs 59 €', LATER)
+
+    assert _settle_edge_validity(new, [visible, discarded]) == []
+    assert (new.invalid_at, new.expired_at) == (LATER, NOW)
+
+
+def test_a_new_edge_still_invalidates_an_older_discarded_edge(monkeypatch):
+    monkeypatch.setattr(edge_operations, 'utc_now', lambda: NOW)
+    new = _price('The plan costs 49 €', LATER)
+    discarded = _price('The plan costs 99 €', EARLIER, **DISCARD_MARK)
+
+    assert _settle_edge_validity(new, [discarded]) == [discarded]
+    assert (discarded.invalid_at, discarded.expired_at) == (LATER, NOW)
+    assert _validity(new) == (None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_a_restatement_absorbed_by_a_discarded_edge_keeps_its_mark_and_invalidates_nothing(
+    mock_llm_client,
+):
+    mock_llm_client.generate_response.return_value = {
+        'duplicate_facts': [0],
+        'contradicted_facts': [1],
+    }
+    restatement = _price('The plan now costs 99 €', LATER)
+    discarded = _price('The plan costs 99 €', LATER, **DISCARD_MARK)
+    visible = _price('The plan costs 49 €', EARLIER)
+
+    resolved, invalidated, _ = await resolve_extracted_edge(
+        mock_llm_client, restatement, [discarded], [visible], _episode()
+    )
+
+    assert resolved.uuid == discarded.uuid
+    assert _mark(resolved) == DISCARD_MARK
+    assert invalidated == []
+    assert _validity(visible) == (None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_a_discarded_restatement_marks_the_unmarked_copy_of_its_audience_and_invalidates_nothing(
+    mock_llm_client,
+):
+    mock_llm_client.generate_response.return_value = {
+        'duplicate_facts': [0],
+        'contradicted_facts': [1],
+    }
+    restatement = _price('The plan now costs 99 €', LATER, **SALES, **DISCARD_MARK)
+    copy = _price('The plan costs 99 €', LATER, **SALES)
+    visible = _price('The plan costs 49 €', EARLIER, **SALES)
+
+    resolved, invalidated, _ = await resolve_extracted_edge(
+        mock_llm_client, restatement, [copy], [visible], _episode()
+    )
+
+    assert [edge.fact for edge in invalidated] == []
+    assert _validity(visible) == (None, None, None)
+    assert resolved.uuid == copy.uuid
+    assert _mark(resolved) == DISCARD_MARK
+
+
+@pytest.mark.asyncio
+async def test_a_discarded_copy_keeps_its_own_mark_against_another_incoming_mark(mock_llm_client):
+    mock_llm_client.generate_response.return_value = {
+        'duplicate_facts': [0],
+        'contradicted_facts': [],
+    }
+    restatement = _price('The plan now costs 99 €', LATER, **SALES, **OTHER_MARK)
+    copy = _price('The plan costs 99 €', LATER, **SALES, **DISCARD_MARK)
+
+    resolved, _, _ = await resolve_extracted_edge(
+        mock_llm_client, restatement, [copy], [], _episode()
+    )
+
+    assert resolved.uuid == copy.uuid
+    assert _mark(resolved) == DISCARD_MARK
+
+
+def test_an_edge_never_takes_the_discard_mark_of_another_audience():
+    stored = {**SALES, 'provenance': ['episode_1']}
+
+    merged = merge_provenance(stored, {**BOARD, **DISCARD_MARK, 'provenance': ['episode_2']})
+
+    assert merged == {**SALES, 'provenance': ['episode_1', 'episode_2']}

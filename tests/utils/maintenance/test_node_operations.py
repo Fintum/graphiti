@@ -1103,3 +1103,59 @@ async def test_batch_summaries_calls_llm_for_long_summary():
     # LLM should have been called to condense the long summary
     llm_client.generate_response.assert_awaited_once()
     assert node.summary == 'Condensed summary'
+
+
+DECLARING_SALES = {'org_public': True, 'directory': False, 'acl_key': 'slack:sales'}
+DECLARING_BOARD = {'org_public': True, 'directory': False, 'acl_key': 'slack:board'}
+CITED_BY_SALES_AND_BOARD = {'provenance': ['episode-of-sales', 'episode-of-board']}
+DISCARD_MARK = {
+    'discarded_at': '2026-11-19T10:00:00+00:00',
+    'discarded_by': 'suppression-1',
+    'discarded_episodes': ['episode-of-sales'],
+}
+OTHER_MARK = {
+    'discarded_at': '2026-11-20T09:00:00+00:00',
+    'discarded_by': 'suppression-2',
+    'discarded_episodes': ['episode-of-sales', 'another-episode'],
+}
+
+
+def _absorbing_copy(stored: dict, extracted: dict) -> EntityNode:
+    copy = EntityNode(
+        name='Pricing Committee', group_id='group', labels=['Entity'], attributes=stored
+    )
+    node = EntityNode(
+        name='Pricing Committee', group_id='group', labels=['Entity'], attributes=extracted
+    )
+    state = DedupResolutionState(resolved_nodes=[None], uuid_map={}, unresolved_indices=[])
+
+    _resolve_with_similarity([node], _build_candidate_indexes([copy]), state)
+
+    assert state.resolved_nodes[0] is copy
+    return copy
+
+
+def test_an_entity_known_only_by_the_episodes_citing_it_never_takes_a_discard_mark():
+    copy = _absorbing_copy(
+        dict(CITED_BY_SALES_AND_BOARD), {'provenance': ['episode-of-sales'], **DISCARD_MARK}
+    )
+
+    assert copy.attributes == CITED_BY_SALES_AND_BOARD
+
+
+def test_a_node_declaring_its_audience_takes_the_discard_mark_of_a_restatement_of_it():
+    copy = _absorbing_copy(dict(DECLARING_SALES), {**DECLARING_SALES, **DISCARD_MARK})
+
+    assert copy.attributes == {**DECLARING_SALES, **DISCARD_MARK}
+
+
+def test_a_node_never_takes_the_discard_mark_of_another_audience():
+    copy = _absorbing_copy(dict(DECLARING_SALES), {**DECLARING_BOARD, **DISCARD_MARK})
+
+    assert copy.attributes == DECLARING_SALES
+
+
+def test_a_discarded_node_keeps_its_own_mark_against_another_incoming_mark():
+    copy = _absorbing_copy({**DECLARING_SALES, **DISCARD_MARK}, {**DECLARING_SALES, **OTHER_MARK})
+
+    assert copy.attributes == {**DECLARING_SALES, **DISCARD_MARK}
