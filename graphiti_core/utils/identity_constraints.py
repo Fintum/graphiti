@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
 IDENTITY_FIELDS = frozenset({'user_id', 'task_id', 'document_id', 'organization_id', 'identity_key'})
 SCOPE_FIELDS = frozenset({'org_public', 'directory', 'owner_user_id', 'acl_key'})
-DISCARD_FIELDS = frozenset({'discarded_at', 'discarded_by', 'discarded_episodes'})
+DISCARD_FIELDS = frozenset({'discarded_at', 'discarded_by', 'kept_episodes'})
 PROTECTED_ATTRIBUTES = IDENTITY_FIELDS | SCOPE_FIELDS | DISCARD_FIELDS | frozenset({
     'provenance', 'source_key', 'revision_id', 'evidence_refs', 'policy_version',
     'last_activity_at', 'deleted_at',

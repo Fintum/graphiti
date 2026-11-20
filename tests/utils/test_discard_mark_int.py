@@ -25,7 +25,7 @@ EMBEDDING = [0.1, 0.2, 0.3]
 DISCARD_MARK = {
     'discarded_at': '2026-11-19T10:00:00+00:00',
     'discarded_by': 'suppression-1',
-    'discarded_episodes': ['ep1'],
+    'kept_episodes': ['ep-board'],
 }
 EDGE = "MATCH ()-[x:RELATES_TO {uuid: 'costs'}]->()"
 NODE = "MATCH (x:Entity {uuid: 'pricing'})"
@@ -47,9 +47,14 @@ async def save_in_bulk(driver: FalkorDriver, nodes: list[EntityNode], edges: lis
 WRITES = pytest.mark.parametrize(
     'write', [save_one_by_one, save_in_bulk], ids=['one by one', 'in bulk']
 )
+RESTATEMENTS = pytest.mark.parametrize(
+    'restated',
+    [{}, {'kept_episodes': ['ep-stale']}],
+    ids=['silent on kept episodes', 'with other kept episodes'],
+)
 
 
-def entity(uuid: str, episodes: list[str]) -> EntityNode:
+def entity(uuid: str, episodes: list[str], **attributes: object) -> EntityNode:
     return EntityNode(
         uuid=uuid,
         name=uuid.title(),
@@ -57,11 +62,11 @@ def entity(uuid: str, episodes: list[str]) -> EntityNode:
         labels=['Entity', 'Topic'],
         created_at=CREATED,
         name_embedding=EMBEDDING,
-        attributes={'provenance': episodes},
+        attributes={'provenance': episodes, **attributes},
     )
 
 
-def price(episodes: list[str]) -> EntityEdge:
+def price(episodes: list[str], **attributes: object) -> EntityEdge:
     return EntityEdge(
         uuid='costs',
         group_id=GROUP,
@@ -73,7 +78,7 @@ def price(episodes: list[str]) -> EntityEdge:
         created_at=CREATED,
         valid_at=CREATED,
         fact_embedding=EMBEDDING,
-        attributes={'provenance': episodes},
+        attributes={'provenance': episodes, **attributes},
     )
 
 
@@ -116,24 +121,26 @@ def stored(graph, match: str) -> list:
 
 
 @WRITES
+@RESTATEMENTS
 async def test_a_deduplicated_restatement_keeps_the_discard_mark_of_the_edge(
-    graph, driver, write: Write
+    graph, driver, write: Write, restated: dict
 ):
     await write(driver, [entity('plan', ['ep1']), entity('pricing', ['ep1'])], [price(['ep1'])])
     discard(graph, EDGE)
 
-    await write(driver, [], [price(['ep1', 'ep2'])])
+    await write(driver, [], [price(['ep1', 'ep2'], **restated)])
 
     assert stored(graph, EDGE) == [[*DISCARD_MARK.values(), ['ep1', 'ep2']]]
 
 
 @WRITES
+@RESTATEMENTS
 async def test_a_deduplicated_restatement_keeps_the_discard_mark_of_the_node(
-    graph, driver, write: Write
+    graph, driver, write: Write, restated: dict
 ):
     await write(driver, [entity('pricing', ['ep1'])], [])
     discard(graph, NODE)
 
-    await write(driver, [entity('pricing', ['ep1', 'ep2'])], [])
+    await write(driver, [entity('pricing', ['ep1', 'ep2'], **restated)], [])
 
     assert stored(graph, NODE) == [[*DISCARD_MARK.values(), ['ep1', 'ep2']]]

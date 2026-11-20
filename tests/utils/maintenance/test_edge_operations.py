@@ -1013,12 +1013,12 @@ NOW = datetime(2026, 3, 1, tzinfo=timezone.utc)
 DISCARD_MARK = {
     'discarded_at': '2026-11-19T10:00:00+00:00',
     'discarded_by': 'suppression-1',
-    'discarded_episodes': ['episode-of-sales'],
+    'kept_episodes': ['episode-of-board'],
 }
 OTHER_MARK = {
     'discarded_at': '2026-11-20T09:00:00+00:00',
     'discarded_by': 'suppression-2',
-    'discarded_episodes': ['episode-of-sales', 'another-episode'],
+    'kept_episodes': ['episode-of-board', 'another-episode'],
 }
 SALES = {'org_public': True, 'directory': False, 'acl_key': 'slack:sales'}
 BOARD = {'org_public': True, 'directory': False, 'acl_key': 'slack:board'}
@@ -1151,6 +1151,14 @@ async def test_a_discarded_copy_keeps_its_own_mark_against_another_incoming_mark
 
     assert resolved.uuid == copy.uuid
     assert _mark(resolved) == DISCARD_MARK
+
+
+def test_an_edge_takes_the_kept_episodes_with_the_discard_mark_of_its_audience():
+    stored = {**SALES, 'provenance': ['episode_1']}
+
+    merged = merge_provenance(stored, {**SALES, **DISCARD_MARK, 'provenance': ['episode_2']})
+
+    assert merged == {**SALES, **DISCARD_MARK, 'provenance': ['episode_1', 'episode_2']}
 
 
 def test_an_edge_never_takes_the_discard_mark_of_another_audience():

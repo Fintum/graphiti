@@ -1111,12 +1111,12 @@ CITED_BY_SALES_AND_BOARD = {'provenance': ['episode-of-sales', 'episode-of-board
 DISCARD_MARK = {
     'discarded_at': '2026-11-19T10:00:00+00:00',
     'discarded_by': 'suppression-1',
-    'discarded_episodes': ['episode-of-sales'],
+    'kept_episodes': ['episode-of-board'],
 }
 OTHER_MARK = {
     'discarded_at': '2026-11-20T09:00:00+00:00',
     'discarded_by': 'suppression-2',
-    'discarded_episodes': ['episode-of-sales', 'another-episode'],
+    'kept_episodes': ['episode-of-board', 'another-episode'],
 }
 
 

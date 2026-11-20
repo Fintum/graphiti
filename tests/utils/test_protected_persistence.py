@@ -2,6 +2,9 @@
 
 import re
 
+import pytest
+from pydantic import BaseModel
+
 from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.graph_queries import get_range_indices
 from graphiti_core.models.edges.edge_db_queries import (
@@ -17,6 +20,7 @@ from graphiti_core.utils.identity_constraints import (
     preserve_authority,
     prompt_attributes,
 )
+from graphiti_core.utils.maintenance.attribute_utils import apply_capped_attributes
 from graphiti_core.utils.protected_persistence import (
     STORED_EDGE_TYPES,
     STORED_NODE_LABELS,
@@ -27,9 +31,14 @@ from graphiti_core.utils.protected_persistence import (
 DISCARD_MARK = {
     'discarded_at': '2026-11-19T10:00:00+00:00',
     'discarded_by': 'suppression-1',
-    'discarded_episodes': ['episode-of-sales'],
+    'kept_episodes': ['episode-of-board'],
 }
-FORGED_MARK = {'discarded_at': None, 'discarded_by': 'llm', 'discarded_episodes': ['forged']}
+FORGED_MARK = {'discarded_at': None, 'discarded_by': 'llm', 'kept_episodes': ['forged']}
+
+
+class _CuratedRole(BaseModel):
+    title: str | None = None
+    kept_episodes: list[str] | None = None
 
 
 def union(variable: str, key: str) -> str:
@@ -83,6 +92,19 @@ def test_new_attributes_keep_the_stored_discard_mark_whatever_the_answer_says():
         **DISCARD_MARK,
         'title': 'CEO',
     }
+
+
+@pytest.mark.parametrize('merge_mode', ['overlay', 'replace'])
+def test_the_llm_cannot_forge_kept_episodes_even_when_the_type_declares_them(merge_mode):
+    answer = {'title': 'CEO', 'kept_episodes': ['forged']}
+
+    unmarked, _ = apply_capped_attributes(answer, _CuratedRole, {}, merge_mode=merge_mode)
+    marked, _ = apply_capped_attributes(
+        answer, _CuratedRole, dict(DISCARD_MARK), merge_mode=merge_mode
+    )
+
+    assert unmarked == {'title': 'CEO'}
+    assert marked == {**DISCARD_MARK, 'title': 'CEO'}
 
 
 def test_every_entity_rewrite_keeps_the_stored_discard_mark():
