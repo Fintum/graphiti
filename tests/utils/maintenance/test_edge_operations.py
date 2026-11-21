@@ -18,7 +18,7 @@ from graphiti_core.utils.maintenance.edge_operations import (
     resolve_extracted_edges,
     search_related_edges,
 )
-from graphiti_core.utils.maintenance.resolution_decisions import EdgeQuestion
+from graphiti_core.utils.maintenance.resolution_decisions import EdgeQuestion, EdgeVerdict
 
 
 @pytest.fixture
@@ -1167,3 +1167,117 @@ def test_an_edge_never_takes_the_discard_mark_of_another_audience():
     merged = merge_provenance(stored, {**BOARD, **DISCARD_MARK, 'provenance': ['episode_2']})
 
     assert merged == {**SALES, 'provenance': ['episode_1', 'episode_2']}
+
+
+SLOTS = [
+    pytest.param('IMPLEMENTS', 'lumora', 'project', False, id='another relation on one end'),
+    pytest.param('CONTRACTS', 'harinera', 'lumora', False, id='another relation on no end'),
+    pytest.param('RESPONSIBLE_FOR', 'brezo', 'dashboards', False, id='the same relation on no end'),
+    pytest.param('RESPONSIBLE_FOR', 'brezo', 'project', True, id='the same relation on one end'),
+    pytest.param('LEADS', 'alba', 'project', True, id='the same two ends under another relation'),
+    pytest.param('LED_BY', 'project', 'alba', True, id='the same two ends reversed'),
+]
+
+
+def _responsibility(name: str, source: str, target: str, valid_at: datetime) -> EntityEdge:
+    return EntityEdge(
+        source_node_uuid=source,
+        target_node_uuid=target,
+        name=name,
+        group_id='group_1',
+        fact=f'{source} {name} {target}',
+        episodes=['episode_1'],
+        created_at=EARLIER,
+        valid_at=valid_at,
+        invalid_at=None,
+    )
+
+
+def _contradicting_everything(mock_llm_client) -> None:
+    mock_llm_client.generate_response.return_value = {
+        'duplicate_facts': [],
+        'contradicted_facts': [0],
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('name, source, target, same_slot', SLOTS)
+async def test_a_new_edge_ends_an_older_one_only_in_its_slot(
+    mock_llm_client, monkeypatch, name, source, target, same_slot
+):
+    monkeypatch.setattr(edge_operations, 'utc_now', lambda: NOW)
+    _contradicting_everything(mock_llm_client)
+    new = _responsibility('RESPONSIBLE_FOR', 'alba', 'project', LATER)
+    older = _responsibility(name, source, target, EARLIER)
+
+    _, invalidated, _ = await resolve_extracted_edge(mock_llm_client, new, [], [older], _episode())
+
+    assert [edge.uuid for edge in invalidated] == ([older.uuid] if same_slot else [])
+    assert (older.invalid_at, older.expired_at) == ((LATER, NOW) if same_slot else (None, None))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('name, source, target, same_slot', SLOTS)
+async def test_a_newer_edge_ends_the_new_one_only_in_its_slot(
+    mock_llm_client, monkeypatch, name, source, target, same_slot
+):
+    monkeypatch.setattr(edge_operations, 'utc_now', lambda: NOW)
+    _contradicting_everything(mock_llm_client)
+    new = _responsibility('RESPONSIBLE_FOR', 'alba', 'project', EARLIER)
+    newer = _responsibility(name, source, target, LATER)
+
+    resolved, invalidated, _ = await resolve_extracted_edge(
+        mock_llm_client, new, [], [newer], _episode()
+    )
+
+    assert invalidated == []
+    assert (resolved.invalid_at, resolved.expired_at) == (
+        (LATER, NOW) if same_slot else (None, None)
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_decisions_are_offered_only_the_stored_edges_in_the_slot(monkeypatch):
+    monkeypatch.setattr(edge_operations, 'utc_now', lambda: NOW)
+    new = _responsibility('RESPONSIBLE_FOR', 'alba', 'project', LATER)
+    stored = {slot.id: _responsibility(*slot.values[:3], EARLIER) for slot in SLOTS}
+    in_slot = [stored[slot.id].uuid for slot in SLOTS if slot.values[3]]
+
+    async def get_between_nodes(driver, source_node_uuid, target_node_uuid):
+        return []
+
+    async def search(
+        clients, query, group_ids=None, config=None, search_filter=None, query_vector=None
+    ):
+        return SearchResults(edges=list(stored.values()))
+
+    offered: list[list[str]] = []
+
+    async def resolve_edges(episode, questions):
+        offered.extend([edge.uuid for edge in question.invalidations] for question in questions)
+        return [EdgeVerdict(None, question.invalidations) for question in questions]
+
+    monkeypatch.setattr(EntityEdge, 'get_between_nodes', get_between_nodes)
+    monkeypatch.setattr(edge_operations, 'search', search)
+    monkeypatch.setattr(
+        edge_operations, 'create_entity_edge_embeddings', AsyncMock(return_value=None)
+    )
+    decisions = SimpleNamespace(
+        resolve_edges=resolve_edges, date_edges=AsyncMock(return_value=None)
+    )
+
+    _, invalidated, _ = await resolve_extracted_edges(
+        _mock_clients(),
+        [new],
+        _episode(),
+        [
+            _entity_node(uuid)
+            for uuid in ('alba', 'project', 'lumora', 'harinera', 'brezo', 'dashboards')
+        ],
+        {},
+        {},
+        decisions=decisions,
+    )
+
+    assert offered == [in_slot]
+    assert [edge.uuid for edge in invalidated] == in_slot

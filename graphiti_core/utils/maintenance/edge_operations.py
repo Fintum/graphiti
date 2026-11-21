@@ -712,7 +712,8 @@ def _edge_question(
 ) -> EdgeQuestion:
     """Keep the edges an extracted edge may restate or contradict without crossing its scope.
 
-    Duplicates must also share the relation name, the group and both endpoints.
+    Duplicates must also share the relation name, the group and both endpoints. Invalidation
+    candidates must share the group and the extracted edge's slot.
     """
     related_edges = [edge for edge in related_edges
                      if scopes_compatible(extracted_edge.attributes, edge.attributes)
@@ -722,8 +723,22 @@ def _edge_question(
                      and edge.target_node_uuid == extracted_edge.target_node_uuid]
     existing_edges = [edge for edge in existing_edges
                       if scopes_compatible(extracted_edge.attributes, edge.attributes)
-                      and edge.group_id == extracted_edge.group_id]
+                      and edge.group_id == extracted_edge.group_id
+                      and _same_slot(extracted_edge, edge)]
     return EdgeQuestion(extracted_edge, tuple(related_edges), tuple(existing_edges))
+
+
+def _same_slot(extracted_edge: EntityEdge, edge: EntityEdge) -> bool:
+    """The same relation on an endpoint in common, or the same two endpoints under any relation.
+
+    The hybrid search finds candidates by the text of the fact alone, so without this an edge
+    could end a fact of another subject that only reads alike.
+    """
+    extracted_ends = {extracted_edge.source_node_uuid, extracted_edge.target_node_uuid}
+    ends = {edge.source_node_uuid, edge.target_node_uuid}
+    return ends == extracted_ends or (
+        edge.name == extracted_edge.name and bool(ends & extracted_ends)
+    )
 
 
 def _literal_duplicate(question: EdgeQuestion, episode: EpisodicNode) -> EntityEdge | None:

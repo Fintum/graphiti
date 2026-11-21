@@ -350,7 +350,7 @@ def extracted_relations() -> list[EntityEdge]:
         relation('literal', 'ana', 'budget', 'OWNS', ' ana owns the BUDGET '),
         relation('paraphrase', 'ana', 'review', 'MANAGES', 'Ana is in charge of the budget review'),
         relation('update', 'luis', 'apollo', 'LEADS', 'Luis now leads Apollo'),
-        relation('backfill', 'marta', 'board', 'CHAIRED', 'Marta chaired the board in 2020'),
+        relation('backfill', 'marta', 'board', 'CHAIRS', 'Marta chaired the board in 2020'),
         relation(
             'scoped', 'ana', 'note', 'SHARES', 'Ana shares the note again', NOW, owner_user_id=7
         ),

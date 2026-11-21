@@ -46,7 +46,8 @@ class EdgeQuestion:
     """An extracted edge with the stored edges it may restate or contradict.
 
     Duplicates share both endpoints, the relation name and a compatible scope; invalidation
-    candidates come from the hybrid search and share a compatible scope.
+    candidates come from the hybrid search, share a compatible scope and fill the extracted
+    edge's slot: the same relation on an endpoint in common, or the same two endpoints.
     """
 
     extracted: EntityEdge
