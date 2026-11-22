@@ -1,6 +1,7 @@
 import re
 from collections import Counter
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, NamedTuple
@@ -357,6 +358,17 @@ def extracted_relations() -> list[EntityEdge]:
     ]
 
 
+@dataclass(frozen=True)
+class OneHolder:
+    """A relation whose target has one holder at a time: a project one leader, a board one chair."""
+
+    anchor: str = 'target'
+    labels: frozenset[str] = frozenset({'Entity'})
+
+
+ONE_HOLDER = {'LEADS': OneHolder(), 'CHAIRS': OneHolder()}
+
+
 def endpoints() -> list[EntityNode]:
     return [
         entity(uuid, uuid.title(), 'Entity')
@@ -384,6 +396,7 @@ async def resolve_node_fixture(monkeypatch, llm: RecordingLlm, **options):
 
 
 async def resolve_edge_fixture(monkeypatch, llm: RecordingLlm, **options):
+    options.setdefault('functional_slots', ONE_HOLDER)
     stored = stored_relations()
 
     async def get_between_nodes(driver, source_node_uuid, target_node_uuid):
@@ -754,7 +767,9 @@ async def test_edge_verdicts_ignore_duplicates_and_contradictions_the_question_d
 async def test_resolve_extracted_edge_still_composes_question_verdict_and_application(monkeypatch):
     """add_triplet resolves one edge against two overlapping searches.
 
-    Every duplicate the LLM names still comes back, as before the split into phases.
+    Every duplicate the LLM names still comes back, as before the split into phases. With no
+    functional relations to read, another leader of the same project is no candidate: only the
+    same two ends are.
     """
     monkeypatch.setattr(edge_operations, 'utc_now', lambda: NOW)
     heads = relation('heads', 'luis', 'apollo', 'LEADS', 'Luis heads Apollo')
@@ -784,7 +799,6 @@ async def test_resolve_extracted_edge_still_composes_question_verdict_and_applic
                 'new_edge': 'Luis heads Apollo',
                 'edge_invalidation_candidates': [
                     {'idx': 2, 'fact': 'Luis leads Apollo'},
-                    {'idx': 3, 'fact': 'Marta leads Apollo'},
                 ],
             },
             EdgeDuplicate,
@@ -793,8 +807,8 @@ async def test_resolve_extracted_edge_still_composes_question_verdict_and_applic
     assert resolved is leads
     assert duplicates == [leads, runs]
     assert leads.episodes == ['earlier', 'episode']
-    assert invalidated == [marta]
-    assert (marta.invalid_at, marta.expired_at) == (RECENT, NOW)
+    assert invalidated == []
+    assert (marta.invalid_at, marta.expired_at) == (None, None)
 
 
 @pytest.mark.asyncio

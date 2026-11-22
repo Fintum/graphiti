@@ -14,8 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
-from typing import Protocol
+from types import MappingProxyType
+from typing import Literal, Protocol
 
 from pydantic import BaseModel
 
@@ -41,13 +43,34 @@ class NodeQuestion:
     candidates: tuple[EntityNode, ...]
 
 
+class FunctionalSlot(Protocol):
+    """A relation that holds one value per anchor node of the given labels.
+
+    Two edges of that relation on the same anchor fill one slot, so one may end the other even
+    when their other ends differ: one status per task, one owner per task, one manager per person.
+    """
+
+    @property
+    def anchor(self) -> Literal['source', 'target']: ...
+
+    @property
+    def labels(self) -> Collection[str]: ...
+
+
+FunctionalSlots = Mapping[str, FunctionalSlot]
+NO_FUNCTIONAL_SLOTS: FunctionalSlots = MappingProxyType({})
+
+
 @dataclass(frozen=True)
 class EdgeQuestion:
     """An extracted edge with the stored edges it may restate or contradict.
 
     Duplicates share both endpoints, the relation name and a compatible scope; invalidation
     candidates come from the hybrid search, share a compatible scope and fill the extracted
-    edge's slot: the same relation on an endpoint in common, or the same two endpoints.
+    edge's slot: the same two endpoints under any relation and in either direction, or, for a
+    relation the caller declares functional, the same relation on its anchor node when that
+    node has one of the declared labels. With no functional relations, only the same two
+    endpoints.
     """
 
     extracted: EntityEdge

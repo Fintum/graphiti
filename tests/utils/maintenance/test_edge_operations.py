@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -348,7 +349,7 @@ async def test_resolve_extracted_edges_fast_path_deduplication(monkeypatch):
     # Track how many edges reach resolution
     question_count = 0
 
-    def count_edge_question(extracted_edge, related_edges, existing_edges):
+    def count_edge_question(extracted_edge, related_edges, existing_edges, *slot_policy):
         nonlocal question_count
         question_count += 1
         return EdgeQuestion(extracted_edge, (), ())
@@ -840,7 +841,7 @@ def _patch_resolve_extracted_edges_deps(monkeypatch, candidates_by_pair, related
 
     observed: list[tuple[str, list[str]]] = []
 
-    def record_question(extracted_edge, related_edges, existing_edges):
+    def record_question(extracted_edge, related_edges, existing_edges, *slot_policy):
         observed.append((extracted_edge.uuid, [edge.uuid for edge in related_edges]))
         return EdgeQuestion(extracted_edge, (), ())
 
@@ -1173,7 +1174,7 @@ SLOTS = [
     pytest.param('IMPLEMENTS', 'lumora', 'project', False, id='another relation on one end'),
     pytest.param('CONTRACTS', 'harinera', 'lumora', False, id='another relation on no end'),
     pytest.param('RESPONSIBLE_FOR', 'brezo', 'dashboards', False, id='the same relation on no end'),
-    pytest.param('RESPONSIBLE_FOR', 'brezo', 'project', True, id='the same relation on one end'),
+    pytest.param('RESPONSIBLE_FOR', 'brezo', 'project', False, id='the same relation on one end'),
     pytest.param('LEADS', 'alba', 'project', True, id='the same two ends under another relation'),
     pytest.param('LED_BY', 'project', 'alba', True, id='the same two ends reversed'),
 ]
@@ -1281,3 +1282,143 @@ async def test_the_decisions_are_offered_only_the_stored_edges_in_the_slot(monke
 
     assert offered == [in_slot]
     assert [edge.uuid for edge in invalidated] == in_slot
+
+
+@dataclass(frozen=True)
+class _Functional:
+    anchor: str
+    labels: frozenset[str]
+
+
+FUNCTIONAL = {
+    'HAS_STATUS': _Functional('source', frozenset({'Task'})),
+    'RESPONSIBLE_FOR': _Functional('target', frozenset({'Task'})),
+    'REPORTS_TO': _Functional('source', frozenset({'Person'})),
+}
+LABELS = {
+    'task': 'Task',
+    'project': 'Project',
+    'open': 'Status',
+    'done': 'Status',
+    'alba': 'Person',
+    'brezo': 'Person',
+    'ciro': 'Person',
+    'bug': 'Challenge',
+    'leak': 'Challenge',
+    'pipedrive': 'Company',
+}
+FORMS = [
+    pytest.param(
+        ('HAS_STATUS', 'task', 'done'),
+        ('HAS_STATUS', 'task', 'open'),
+        True,
+        id='a status change of a task, on the source',
+    ),
+    pytest.param(
+        ('RESPONSIBLE_FOR', 'brezo', 'task'),
+        ('RESPONSIBLE_FOR', 'alba', 'task'),
+        True,
+        id='a new owner of the same task, on the target',
+    ),
+    pytest.param(
+        ('RESPONSIBLE_FOR', 'brezo', 'project'),
+        ('RESPONSIBLE_FOR', 'alba', 'project'),
+        False,
+        id='an owner of a target that is no task',
+    ),
+    pytest.param(
+        ('AFFECTS', 'leak', 'pipedrive'),
+        ('AFFECTS', 'bug', 'pipedrive'),
+        False,
+        id='the same target under a relation off the list',
+    ),
+    pytest.param(
+        ('RESPONSIBLE_FOR', 'alba', 'task'),
+        ('RESPONSIBLE_FOR', 'alba', 'project'),
+        False,
+        id='the same source of a relation anchored on its target',
+    ),
+    pytest.param(
+        ('REPORTS_TO', 'brezo', 'ciro'),
+        ('REPORTS_TO', 'alba', 'brezo'),
+        False,
+        id='crossed: the end in common on the other side',
+    ),
+    pytest.param(
+        ('HAS_STATUS', 'task', 'done'),
+        ('BLOCKED_AS', 'done', 'task'),
+        True,
+        id='the same two ends under another relation, reversed',
+    ),
+]
+
+
+async def _ended_in_slot(monkeypatch, new, older, functional_slots):
+    """What resolve_extracted_edges ends for the new edge when the decisions contradict all."""
+    monkeypatch.setattr(edge_operations, 'utc_now', lambda: NOW)
+
+    async def get_between_nodes(driver, source_node_uuid, target_node_uuid):
+        return []
+
+    async def search(
+        clients, query, group_ids=None, config=None, search_filter=None, query_vector=None
+    ):
+        return SearchResults(edges=[older])
+
+    async def resolve_edges(episode, questions):
+        return [EdgeVerdict(None, question.invalidations) for question in questions]
+
+    monkeypatch.setattr(EntityEdge, 'get_between_nodes', get_between_nodes)
+    monkeypatch.setattr(edge_operations, 'search', search)
+    monkeypatch.setattr(
+        edge_operations, 'create_entity_edge_embeddings', AsyncMock(return_value=None)
+    )
+    decisions = SimpleNamespace(
+        resolve_edges=resolve_edges, date_edges=AsyncMock(return_value=None)
+    )
+    nodes = [
+        EntityNode(uuid=uuid, name=uuid, group_id='group_1', labels=['Entity', label])
+        for uuid, label in LABELS.items()
+    ]
+    _, invalidated, _ = await resolve_extracted_edges(
+        _mock_clients(),
+        [new],
+        _episode(),
+        nodes,
+        {},
+        {},
+        decisions=decisions,
+        functional_slots=functional_slots,
+    )
+    return [edge.uuid for edge in invalidated]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('new_form, older_form, same_slot', FORMS)
+async def test_a_functional_slot_is_one_value_on_its_anchor(
+    monkeypatch, new_form, older_form, same_slot
+):
+    new = _responsibility(*new_form, LATER)
+    older = _responsibility(*older_form, EARLIER)
+
+    ended = await _ended_in_slot(monkeypatch, new, older, FUNCTIONAL)
+
+    assert ended == ([older.uuid] if same_slot else [])
+    assert (older.invalid_at, older.expired_at) == ((LATER, NOW) if same_slot else (None, None))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('new_form, older_form, same_slot', FORMS)
+async def test_without_functional_slots_only_the_same_two_ends_fill_a_slot(
+    monkeypatch, new_form, older_form, same_slot
+):
+    new = _responsibility(*new_form, LATER)
+    older = _responsibility(*older_form, EARLIER)
+    same_ends = {new.source_node_uuid, new.target_node_uuid} == {
+        older.source_node_uuid,
+        older.target_node_uuid,
+    }
+
+    ended = await _ended_in_slot(monkeypatch, new, older, {})
+
+    assert ended == ([older.uuid] if same_ends else [])

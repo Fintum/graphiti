@@ -2,6 +2,7 @@ import hashlib
 import json
 import re
 from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, NamedTuple
@@ -292,6 +293,17 @@ def entity(
     )
 
 
+@dataclass(frozen=True)
+class OneLeader:
+    """A project has one leader at a time, so a new leader fills the old one's slot."""
+
+    anchor: str = 'target'
+    labels: frozenset[str] = frozenset({'Entity'})
+
+
+ONE_LEADER = {'LEADS': OneLeader()}
+
+
 def relation(
     uuid: str,
     source: str,
@@ -513,7 +525,7 @@ async def hydrate(monkeypatch, llm: RecordingLlm, marked: bool = False, graphiti
         entity_types=ENTITY_TYPES,
         edge_types=EDGE_TYPES,
         edge_type_map=EDGE_TYPE_MAP,
-        **{'get_previous_episodes': True, **options},
+        **{'get_previous_episodes': True, 'functional_slots': ONE_LEADER, **options},
     )
 
 

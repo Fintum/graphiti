@@ -1,6 +1,7 @@
 import hashlib
 import json
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, NamedTuple
@@ -20,6 +21,17 @@ GROUP = 'group'
 # (prompt_name, messages) and outcome of the episode on 5202f54, before any vector was reused.
 PROMPTS_SHA = 'e588d80353cad8ae034517b0334a692498aceeb32780f50547b78bc9cc50ef7a'
 OUTCOME_SHA = '91a5865349a5e40092902b9f809916e7549d9468ea3ec24970c66fcaa82e434b'
+
+@dataclass(frozen=True)
+class OneLeader:
+    """A project has one leader at a time, so a new leader fills the old one's slot."""
+
+    anchor: str = 'target'
+    labels: frozenset[str] = frozenset({'Entity'})
+
+
+ONE_LEADER = {'LEADS': OneLeader()}
+
 
 STORED_NODES = {'ana': 'Ana', 'marta': 'Marta', 'program': 'Apollo Program'}
 STORED_EDGES = {
@@ -200,6 +212,7 @@ async def hydrate(monkeypatch, graph: StoredGraph | None = None, nodes=(), edges
         extracted_nodes=[node(*extracted) for extracted in [*EXTRACTED_NODES, *nodes]],
         extracted_edges=[edge(*extracted) for extracted in [*EXTRACTED_EDGES, *edges]],
         previous_episodes=[episode('earlier', 'Marta set up the Apollo Program.', EARLIER)],
+        functional_slots=ONE_LEADER,
     )
     return Hydrated(*result, llm, embedder, searched)
 

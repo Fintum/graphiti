@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from time import time
 from typing import Any
@@ -57,8 +57,10 @@ from graphiti_core.utils.maintenance.identity_constraints import (
     scopes_compatible,
 )
 from graphiti_core.utils.maintenance.resolution_decisions import (
+    NO_FUNCTIONAL_SLOTS,
     EdgeQuestion,
     EdgeVerdict,
+    FunctionalSlots,
     LlmResolutionDecisions,
     ResolutionDecisions,
 )
@@ -357,6 +359,7 @@ async def resolve_extracted_edges(
     acl: EnrichmentAcl | None = None,
     decisions: ResolutionDecisions | None = None,
     edge_attributes: EdgeAttributes | None = None,
+    functional_slots: FunctionalSlots = NO_FUNCTIONAL_SLOTS,
 ) -> tuple[list[EntityEdge], list[EntityEdge], list[EntityEdge]]:
     """Resolve extracted edges against existing graph context.
 
@@ -364,6 +367,10 @@ async def resolve_extracted_edges(
     ``decisions.resolve_edges`` call, and the new edges are dated in a single ``date_edges`` call;
     ``decisions=None`` means today's LLM prompts. ``edge_attributes`` answers the typed edges in a
     single call instead of one attributes prompt each.
+
+    An extracted edge may only end, or be ended by, a stored edge between the same two endpoints,
+    or one of a relation in ``functional_slots`` on the same anchor node with a declared label
+    (see ``EdgeQuestion``). Without it, only the same two endpoints.
 
     The extracted edges are embedded in one batch whose vectors also serve their searches. The
     stored edges an episode resolves to or invalidates come back with no vector, for the caller to
@@ -522,8 +529,11 @@ async def resolve_extracted_edges(
 
     # resolve edges with related edges in the graph and find invalidation candidates
     decisions = decisions or LlmResolutionDecisions(llm_client)
+    labels = {uuid: entity.labels for uuid, entity in uuid_entity_map.items()}
     questions = [
-        _edge_question(extracted_edge, related_edges, existing_edges)
+        _edge_question(
+            extracted_edge, related_edges, existing_edges, functional_slots, labels
+        )
         for extracted_edge, related_edges, existing_edges in zip(
             extracted_edges, related_edges_lists, edge_invalidation_candidates, strict=True
         )
@@ -709,11 +719,14 @@ def _edge_question(
     extracted_edge: EntityEdge,
     related_edges: list[EntityEdge],
     existing_edges: list[EntityEdge],
+    functional_slots: FunctionalSlots = NO_FUNCTIONAL_SLOTS,
+    labels: Mapping[str, Sequence[str]] | None = None,
 ) -> EdgeQuestion:
     """Keep the edges an extracted edge may restate or contradict without crossing its scope.
 
     Duplicates must also share the relation name, the group and both endpoints. Invalidation
-    candidates must share the group and the extracted edge's slot.
+    candidates must share the group and the extracted edge's slot, read with the labels of its
+    endpoints.
     """
     related_edges = [edge for edge in related_edges
                      if scopes_compatible(extracted_edge.attributes, edge.attributes)
@@ -724,21 +737,36 @@ def _edge_question(
     existing_edges = [edge for edge in existing_edges
                       if scopes_compatible(extracted_edge.attributes, edge.attributes)
                       and edge.group_id == extracted_edge.group_id
-                      and _same_slot(extracted_edge, edge)]
+                      and _same_slot(extracted_edge, edge, functional_slots, labels or {})]
     return EdgeQuestion(extracted_edge, tuple(related_edges), tuple(existing_edges))
 
 
-def _same_slot(extracted_edge: EntityEdge, edge: EntityEdge) -> bool:
-    """The same relation on an endpoint in common, or the same two endpoints under any relation.
+def _same_slot(
+    extracted_edge: EntityEdge,
+    edge: EntityEdge,
+    functional_slots: FunctionalSlots,
+    labels: Mapping[str, Sequence[str]],
+) -> bool:
+    """The same two endpoints under any relation and in either direction, or one functional slot.
 
-    The hybrid search finds candidates by the text of the fact alone, so without this an edge
-    could end a fact of another subject that only reads alike.
+    A functional slot is a relation in ``functional_slots`` on the same anchor node, the source
+    or the target as declared, when that node has one of the declared labels. Any other shared
+    endpoint is no slot: a person responsible for two projects holds both, and the hybrid search,
+    which finds candidates by the text of the fact alone, would otherwise let an edge end a fact
+    of another subject that only reads alike.
     """
-    extracted_ends = {extracted_edge.source_node_uuid, extracted_edge.target_node_uuid}
-    ends = {edge.source_node_uuid, edge.target_node_uuid}
-    return ends == extracted_ends or (
-        edge.name == extracted_edge.name and bool(ends & extracted_ends)
-    )
+    if {edge.source_node_uuid, edge.target_node_uuid} == {
+        extracted_edge.source_node_uuid,
+        extracted_edge.target_node_uuid,
+    }:
+        return True
+    slot = functional_slots.get(extracted_edge.name)
+    if slot is None or edge.name != extracted_edge.name:
+        return False
+    on_source = slot.anchor == 'source'
+    anchor = extracted_edge.source_node_uuid if on_source else extracted_edge.target_node_uuid
+    shared = edge.source_node_uuid if on_source else edge.target_node_uuid
+    return shared == anchor and not set(slot.labels).isdisjoint(labels.get(anchor, ()))
 
 
 def _literal_duplicate(question: EdgeQuestion, episode: EpisodicNode) -> EntityEdge | None:

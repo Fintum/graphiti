@@ -117,7 +117,11 @@ from graphiti_core.utils.maintenance.node_operations import (
     extract_nodes_split,
     resolve_extracted_nodes,
 )
-from graphiti_core.utils.maintenance.resolution_decisions import ResolutionDecisions
+from graphiti_core.utils.maintenance.resolution_decisions import (
+    NO_FUNCTIONAL_SLOTS,
+    FunctionalSlots,
+    ResolutionDecisions,
+)
 from graphiti_core.utils.ontology_utils.entity_types_utils import validate_entity_types
 from graphiti_core.utils.text_utils import MAX_SUMMARY_CHARS
 
@@ -780,12 +784,16 @@ class Graphiti:
             node_attributes: NodeAttributes | None = None,
             edge_attributes: EdgeAttributes | None = None,
             should_summarize_node: SummaryPolicy | None = None,
+            functional_slots: FunctionalSlots = NO_FUNCTIONAL_SLOTS,
         ) -> tuple[list[EntityNode], list[EntityEdge], list[EntityEdge], dict[str, str]]:
         """Step 2. Resolve nodes and edges, and extract node attributes, against candidates the acl allows.
 
         Explicit previous_episodes are used as given, with neither retrieval nor the acl,
         and exclude get_previous_episodes. The hooks replace the attribute prompts and choose
         which resolved nodes get their facts appended and a summary; None keeps today's behaviour.
+        ``functional_slots`` names the relations whose edges on one anchor node fill one slot
+        (see ``resolve_extracted_edges``); without it, an edge only ends one between its own two
+        endpoints.
         The stored nodes and edges keep their stored vectors, so an episode embeds the names it
         does not find by uuid and its facts, each in one batch.
         """
@@ -836,6 +844,7 @@ class Graphiti:
             acl=acl,
             decisions=decisions,
             edge_attributes=edge_attributes,
+            functional_slots=functional_slots,
         )
         await reuse_fact_embeddings(self.clients, [*resolved_edges, *invalidated_edges])
         await load_name_embeddings(self.clients.driver, resolved_nodes)
